@@ -1,0 +1,56 @@
+name: 'Register new ECS task definition revision'
+description: >
+  Fetches the current revision of an ECS task definition, strips read-only fields,
+  optionally updates a container image URI, and registers a new revision.
+  Outputs the new task definition ARN.
+
+inputs:
+  task-definition-family:
+    description: 'ECS task definition family name'
+    required: true
+  image-uri:
+    description: 'Container image URI to set. If omitted, the existing image is kept.'
+    required: false
+    default: ''
+  container-name:
+    description: 'Name of the container to update. Required when image-uri is set and the task has multiple containers.'
+    required: false
+    default: ''
+
+outputs:
+  task-definition-arn:
+    description: 'ARN of the newly registered task definition revision'
+    value: ${{ steps.register.outputs.task-definition-arn }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch, clean, and register task definition
+      id: register
+      shell: bash
+      env:
+        FAMILY: ${{ inputs.task-definition-family }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+      run: |
+        TASK_DEF_FILE="task-def-${FAMILY}.json"
+
+        aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition \
+          | jq 'del(.taskDefinitionArn, .revision, .status, .registeredAt, .registeredBy, .compatibilities, .requiresAttributes)' \
+          > "$TASK_DEF_FILE"
+
+        if [ -n "$IMAGE_URI" ]; then
+          if [ -n "$CONTAINER_NAME" ]; then
+            jq --arg image "$IMAGE_URI" --arg name "$CONTAINER_NAME" \
+              '(.containerDefinitions[] | select(.name == $name) | .image) = $image' \
+              "$TASK_DEF_FILE" > "${TASK_DEF_FILE}.tmp"
+          else
+            jq --arg image "$IMAGE_URI" '.containerDefinitions[].image = $image' \
+              "$TASK_DEF_FILE" > "${TASK_DEF_FILE}.tmp"
+          fi
+          mv "${TASK_DEF_FILE}.tmp" "$TASK_DEF_FILE"
+        fi
+
+        ARN=$(aws ecs register-task-definition --cli-input-json "file://$TASK_DEF_FILE" \
+          --query taskDefinition.taskDefinitionArn --output text)
+        echo "task-definition-arn=$ARN" >> "$GITHUB_OUTPUT"

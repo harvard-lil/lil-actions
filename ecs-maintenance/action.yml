@@ -1,0 +1,62 @@
+name: 'Toggle ECS maintenance mode via ALB weighted routing'
+description: >
+  Switches an Application Load Balancer HTTPS listener between a live target group
+  and a maintenance target group using weighted routing.
+  Use mode=on before a deployment, mode=off after.
+
+inputs:
+  mode:
+    description: '"on" to route traffic to maintenance page, "off" to restore live traffic'
+    required: true
+  load-balancer:
+    description: 'ALB name'
+    required: true
+  target-group:
+    description: 'Live target group name'
+    required: true
+  maintenance-target-group:
+    description: 'Maintenance target group name'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Switch ALB listener weights
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        LOAD_BALANCER: ${{ inputs.load-balancer }}
+        TARGET_GROUP: ${{ inputs.target-group }}
+        MAINTENANCE_TARGET_GROUP: ${{ inputs.maintenance-target-group }}
+      run: |
+        if [ "$MODE" = "on" ]; then
+          LIVE_WEIGHT=0
+          MAINT_WEIGHT=100
+        elif [ "$MODE" = "off" ]; then
+          LIVE_WEIGHT=100
+          MAINT_WEIGHT=0
+        else
+          echo "mode must be 'on' or 'off', got: $MODE"
+          exit 1
+        fi
+
+        LB_ARN=$(aws elbv2 describe-load-balancers \
+          --names "$LOAD_BALANCER" \
+          --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+        LISTENER_ARN=$(aws elbv2 describe-listeners \
+          --load-balancer-arn "$LB_ARN" \
+          --query "Listeners[?Protocol=='HTTPS'].ListenerArn" --output text)
+
+        LIVE_TG_ARN=$(aws elbv2 describe-target-groups \
+          --names "$TARGET_GROUP" \
+          --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+        MAINT_TG_ARN=$(aws elbv2 describe-target-groups \
+          --names "$MAINTENANCE_TARGET_GROUP" \
+          --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+        aws elbv2 modify-listener \
+          --listener-arn "$LISTENER_ARN" \
+          --default-actions "Type=forward,ForwardConfig={TargetGroups=[{TargetGroupArn=$LIVE_TG_ARN,Weight=$LIVE_WEIGHT},{TargetGroupArn=$MAINT_TG_ARN,Weight=$MAINT_WEIGHT}]}" \
+          > /dev/null

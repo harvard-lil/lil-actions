@@ -1,0 +1,47 @@
+name: 'Build and push image to AWS ECR'
+description: >
+  Logs in to ECR, builds a Docker image, and pushes it tagged with the commit SHA
+  and a named tag. AWS credentials must be configured in the calling job before this
+  action runs (via aws-actions/configure-aws-credentials).
+
+inputs:
+  ecr-repository:
+    description: 'ECR repository name (not the full URI)'
+    required: true
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  image-tag:
+    description: 'Named tag to apply in addition to the commit SHA tag'
+    required: false
+    default: 'latest'
+
+outputs:
+  image-uri:
+    description: 'Full ECR image URI with the named tag (registry/repository:image-tag)'
+    value: ${{ steps.build-push.outputs.image-uri }}
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push
+      id: build-push
+      shell: bash
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        REPOSITORY: ${{ inputs.ecr-repository }}
+        SHA_TAG: ${{ github.sha }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: |
+        IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+        docker build -t "$REGISTRY/$REPOSITORY:$SHA_TAG" -f "$DOCKERFILE" .
+        docker push "$REGISTRY/$REPOSITORY:$SHA_TAG"
+        docker tag "$REGISTRY/$REPOSITORY:$SHA_TAG" "$IMAGE_URI"
+        docker push "$IMAGE_URI"
+        echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
