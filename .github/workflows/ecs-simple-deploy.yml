@@ -3,18 +3,19 @@ name: ECS simple deploy
 on:
   workflow_call:
     inputs:
-      ecr-repository:
-        description: 'ECR repository name'
+      app-name:
+        description: 'App name matching the Terraform app_name variable (e.g. perma-filecheck)'
         required: true
         type: string
-      ecs-cluster:
-        description: 'ECS cluster name'
-        required: true
+      environment:
+        description: >
+          Deployment environment matching the Terraform environment variable
+          (e.g. staging, production). Leave empty for single-environment apps.
+          When set, this activates the corresponding GitHub Environment, enabling
+          protection rules and environment-scoped secrets.
+        required: false
         type: string
-      ecs-service:
-        description: 'ECS service name'
-        required: true
-        type: string
+        default: ''
       aws-region:
         description: 'AWS region'
         required: false
@@ -27,18 +28,28 @@ on:
         default: Dockerfile
     secrets:
       aws-role-arn:
-        description: 'IAM role ARN to assume via OIDC'
+        description: 'IAM role ARN to assume via OIDC (deploy_role_arn output from Terraform)'
         required: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
     permissions:
       id-token: write
       contents: read
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve full name
+        id: name
+        run: |
+          if [ -n "${{ inputs.environment }}" ]; then
+            echo "full-name=${{ inputs.environment }}-${{ inputs.app-name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "full-name=${{ inputs.app-name }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -49,14 +60,14 @@ jobs:
       - name: Build and push image
         uses: harvard-lil/lil-actions/ecs-build@main
         with:
-          ecr-repository: ${{ inputs.ecr-repository }}
+          ecr-repository: ${{ steps.name.outputs.full-name }}
           dockerfile: ${{ inputs.dockerfile }}
 
       - name: Deploy to ECS
         run: |
           aws ecs update-service \
-            --cluster "${{ inputs.ecs-cluster }}" \
-            --service "${{ inputs.ecs-service }}" \
+            --cluster "${{ steps.name.outputs.full-name }}" \
+            --service "${{ steps.name.outputs.full-name }}" \
             --force-new-deployment \
             --query 'service.deployments' \
             --output table
