@@ -1,10 +1,34 @@
 # lil-actions
 
-Shared GitHub Actions composite actions for harvard-lil projects.
+Shared GitHub Actions composite actions and reusable workflows for harvard-lil projects.
 
-Reference actions from a workflow with `harvard-lil/lil-actions/<action-name>@main`.
+## Reusable workflows
+
+Reusable workflows are full deployment pipelines callable with a single `uses:` line. They're the right choice when the entire deployment pattern is identical across apps — inputs cover the per-app variation and there's nothing left to customize.
+
+Reference them with `uses: harvard-lil/lil-actions/.github/workflows/<workflow-name>.yml@main`.
+
+### `ecs-simple-deploy`
+
+Build, push to ECR, and force a new ECS deployment. Covers stateless single-container apps where the task definition is managed outside of CI and `--force-new-deployment` is sufficient. Uses OIDC for AWS authentication.
+
+```yaml
+jobs:
+  deploy:
+    uses: harvard-lil/lil-actions/.github/workflows/ecs-simple-deploy.yml@main
+    with:
+      ecr-repository: my-app
+      ecs-cluster: my-app
+      ecs-service: my-app
+    secrets:
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+```
+
+**When to use a reusable workflow vs. composite actions:** A reusable workflow is worth adding when a complete deployment pipeline — trigger to finish — is identical across multiple apps with only names changing. Avoid too much if-then, and instead compose complex workflows from building-block actions to make the sequence clear.
 
 ## Actions
+
+Actions are building blocks for more complex deployments. Reference them with `uses: harvard-lil/lil-actions/<action-name>@main`.
 
 ### `docker-compose-update`
 
@@ -16,7 +40,7 @@ Logs in to AWS ECR, builds a Docker image, and pushes it tagged with both the co
 
 ### `ecs-register-task-def`
 
-Fetches the current revision of an ECS task definition, strips read-only fields, optionally updates the container image URI, and registers a new revision. Outputs the new task definition ARN — useful when you need a pinned ARN for EventBridge rules or explicit service updates.
+Fetches the current revision of an ECS task definition, strips read-only fields, optionally updates a container image URI, and registers a new revision. Outputs the new task definition ARN — useful when you need a pinned ARN for EventBridge rules or explicit service updates.
 
 ### `ecs-update-eventbridge`
 
