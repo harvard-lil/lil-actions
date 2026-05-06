@@ -1,7 +1,9 @@
 name: 'Update EventBridge rules with new ECS task definition'
 description: >
   Updates EcsParameters.TaskDefinitionArn on one or more EventBridge rules
-  to point at a new task definition revision.
+  to point at a new task definition revision. Each rule is assumed to have
+  exactly one target; rules with multiple targets are not supported and
+  additional targets would be dropped.
 
 inputs:
   event-rules:
