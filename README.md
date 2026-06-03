@@ -49,12 +49,14 @@ name: Secret scan
 on:
   pull_request:
   push:
-    branches: [main]   # add direct-push branches; PRs are covered already
+    branches: ['**']   # all branches, so a pushed-but-never-PR'd branch is still scanned
 
 jobs:
   secret-scan:
     uses: harvard-lil/lil-actions/.github/workflows/secret-scan.yml@main
 ```
+
+Scan **every branch push**, not just the default branch: a secret pushed to a feature branch that is never opened as a PR is still in the repo and otherwise goes unscanned. `pull_request` is kept mainly for fork PRs on public repos (the contributor's push lands on their fork, so only the PR event sees it).
 
 Defaults to `--results=verified,unknown` (flags confirmed-live *and* unverifiable matches — the safer choice for repos that hold pasted artifacts). Pass `with: { extra_args: '--results=verified' }` to reduce noise, or add `--exclude-paths` for known false positives. This guards against secrets *landing* in a repo; pair it with a local pre-commit hook for pre-push feedback, since CI can only flag a push after it happens.
 
