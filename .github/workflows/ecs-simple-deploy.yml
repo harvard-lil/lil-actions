@@ -28,7 +28,7 @@ on:
         default: Dockerfile
     secrets:
       aws-role-arn:
-        description: 'IAM role ARN to assume via OIDC (deploy_role_arn output from Terraform)'
+        description: 'IAM role ARN to assume via OIDC (github_role_arn output from Terraform)'
         required: true
 
 jobs:
@@ -40,9 +40,10 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Resolve full name
+      - name: Resolve application full name
         id: name
         run: |
           if [ -n "${{ inputs.environment }}" ]; then
@@ -52,7 +53,7 @@ jobs:
           fi
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.aws-role-arn }}
           aws-region: ${{ inputs.aws-region }}
