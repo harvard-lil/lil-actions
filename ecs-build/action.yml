@@ -27,7 +27,7 @@ runs:
   steps:
     - name: Login to AWS ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2.1.5
+      uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
 
     - name: Build and push docker image to AWS ECR
       id: build-push
