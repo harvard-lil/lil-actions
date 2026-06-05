@@ -1,0 +1,37 @@
+version: 2
+
+updates:
+  # GitHub Actions. NOTE: the github-actions ecosystem only scans
+  # `.github/workflows/` for a given directory — it does NOT recurse into
+  # composite `action.yml` files. Since this repo's third-party action refs
+  # live in composite actions (ecs-build, docker-compose-update, …), each
+  # composite-action directory must be listed explicitly alongside "/".
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/docker-compose-update"
+      - "/ecs-build"
+      - "/ecs-maintenance"
+      - "/ecs-register-task-def"
+      - "/ecs-update-eventbridge"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Python helper used by the docker-compose-update action.
+  - package-ecosystem: pip
+    directory: "/docker-compose-update"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      python-dev:
+        patterns:
+          - "*"
