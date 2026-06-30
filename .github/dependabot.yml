@@ -11,6 +11,7 @@ updates:
       - "/"
       - "/docker-compose-update"
       - "/ecs-build"
+      - "/ecs-deploy"
       - "/ecs-maintenance"
       - "/ecs-register-task-def"
       - "/ecs-update-eventbridge"
