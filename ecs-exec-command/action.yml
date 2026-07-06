@@ -1,0 +1,43 @@
+name: 'Run ECS exec command'
+
+description: >
+  Runs a command inside a running ECS service task using ECS Exec.
+  AWS credentials must be configured before this action runs.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+
+  service:
+    description: 'ECS service name'
+    required: true
+
+  container:
+    description: 'ECS container name'
+    required: true
+
+  command:
+    description: 'Command to run inside the ECS container'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run ECS exec command
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+        COMMAND: ${{ inputs.command }}
+      run: |
+        TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --desired-status RUNNING --query "taskArns[0]" --output text)"
+
+        if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+          echo "No running ECS task found for service '$SERVICE' in cluster '$CLUSTER'"
+          exit 1
+        fi
+
+        aws ecs wait tasks-running --cluster "$CLUSTER" --tasks "$TASK_ARN"
+        aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" --container "$CONTAINER" --interactive --command "$COMMAND"

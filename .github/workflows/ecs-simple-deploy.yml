@@ -65,10 +65,7 @@ jobs:
           dockerfile: ${{ inputs.dockerfile }}
 
       - name: Deploy to ECS
-        run: |
-          aws ecs update-service \
-            --cluster "${{ steps.name.outputs.full-name }}" \
-            --service "${{ steps.name.outputs.full-name }}" \
-            --force-new-deployment \
-            --query 'service.deployments' \
-            --output table
+        uses: harvard-lil/lil-actions/ecs-deploy@main
+        with:
+          cluster: "${{ steps.name.outputs.full-name }}"
+          service: "${{ steps.name.outputs.full-name }}"

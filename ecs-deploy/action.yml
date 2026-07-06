@@ -1,0 +1,25 @@
+name: 'Deploy ECS service'
+
+description: >
+  Forces a new deployment of an existing ECS service.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+
+  service:
+    description: 'ECS service name'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy to ECS
+      id: deploy
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+      run: |
+        aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --query 'service.deployments' --output json

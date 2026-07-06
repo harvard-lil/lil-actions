@@ -85,3 +85,45 @@ Updates `EcsParameters.TaskDefinitionArn` on one or more EventBridge rules to po
 ### `ecs-maintenance`
 
 Toggles an Application Load Balancer HTTPS listener between a live target group and a maintenance target group using weighted routing. Use `mode: on` before a deployment that needs a maintenance window, and `mode: off` after.
+
+### `ecs-deploy`
+
+Forces a new deployment of an existing ECS service. Use this when the task definition is already configured to pull a mutable image tag such as `latest`, or when another step has already updated the task definition. AWS credentials must be configured in the calling job before this action runs.
+
+Example:
+
+```yaml
+- name: Deploy to ECS
+  uses: harvard-lil/lil-actions/ecs-deploy@main
+  with:
+    cluster: my-ecs-cluster
+    service: my-ecs-service
+```
+
+### `ecs-exec-command`
+
+Runs a command inside a running ECS service task using ECS Exec. Use this for deployment-time commands such as Django migrations, index refreshes, or other one-off application commands that need to run inside the deployed container. AWS credentials must be configured before this action runs, and ECS Exec must be enabled for the service/task.
+
+Example:
+
+```yaml
+- name: Run Django migrations
+  uses: harvard-lil/lil-actions/ecs-exec-command@main
+  with:
+    cluster: my-ecs-cluster
+    service: my-ecs-service
+    container: my-container
+    command: python manage.py migrate
+```
+
+The same action can be reused for other commands:
+
+```yaml
+- name: Create search index
+  uses: harvard-lil/lil-actions/ecs-exec-command@main
+  with:
+    cluster: my-ecs-cluster
+    service: my-ecs-service
+    container: my-container
+    command: invoke create-search-index
+```
