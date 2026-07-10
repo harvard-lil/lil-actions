@@ -21,12 +21,12 @@ inputs:
   check-command:
     description: 'Command used to check for pending Django migrations'
     required: false
-    default: 'uv run python manage.py migrate --plan'
+    default: 'uv run --no-sync python manage.py migrate --plan'
 
   migrate-command:
     description: 'Command used to run Django migrations'
     required: false
-    default: 'uv run python manage.py migrate --noinput'
+    default: 'uv run --no-sync python manage.py migrate --noinput'
 
 runs:
   using: composite
@@ -62,9 +62,23 @@ runs:
 
         echo "Checking for pending Django migrations..."
 
+        set +e
         OUTPUT="$(aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" --container "$CONTAINER" --interactive --command "/bin/sh -lc '$CHECK_COMMAND'" 2>&1)"
+        
+        STATUS="$?"
+        set -e
 
         echo "$OUTPUT"
+
+        if [ "$STATUS" -ne 0 ]; then
+          echo "Migration check command failed."
+          exit "$STATUS"
+        fi
+
+        if echo "$OUTPUT" | grep -q "Cannot perform start session"; then
+          echo "ECS Exec session failed."
+          exit 1
+        fi
 
         if echo "$OUTPUT" | grep -q "No planned migration operations"; then
           echo "No pending migrations."
