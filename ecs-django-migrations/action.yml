@@ -1,0 +1,90 @@
+name: 'Run Django migrations on ECS'
+
+description: >
+  Checks for pending Django migrations inside a running ECS service task.
+  If migrations are pending, runs Django migrate. AWS credentials must be
+  configured before this action runs.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+
+  service:
+    description: 'ECS service name'
+    required: true
+
+  container:
+    description: 'ECS container name'
+    required: true
+
+  check-command:
+    description: 'Command used to check for pending Django migrations'
+    required: false
+    default: 'uv run python manage.py migrate --plan'
+
+  migrate-command:
+    description: 'Command used to run Django migrations'
+    required: false
+    default: 'uv run python manage.py migrate --noinput'
+
+runs:
+  using: composite
+  steps:
+    - name: Find running ECS task
+      id: task
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+      run: |
+        set -euo pipefail
+
+        TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --desired-status RUNNING --query "taskArns[0]" --output text)"
+
+        if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+          echo "No running ECS task found for service '$SERVICE' in cluster '$CLUSTER'"
+          exit 1
+        fi
+
+        echo "task-arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
+
+    - name: Check for pending Django migrations
+      id: check
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        CONTAINER: ${{ inputs.container }}
+        CHECK_COMMAND: ${{ inputs.check-command }}
+        TASK_ARN: ${{ steps.task.outputs.task-arn }}
+      run: |
+        set -euo pipefail
+
+        echo "Checking for pending Django migrations..."
+
+        OUTPUT="$(aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" --container "$CONTAINER" --interactive --command "/bin/sh -lc '$CHECK_COMMAND'" 2>&1)"
+
+        echo "$OUTPUT"
+
+        if echo "$OUTPUT" | grep -q "No planned migration operations"; then
+          echo "No pending migrations."
+          echo "pending=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Pending migrations found."
+          echo "pending=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run pending Django migrations
+      if: steps.check.outputs.pending == 'true'
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        CONTAINER: ${{ inputs.container }}
+        MIGRATE_COMMAND: ${{ inputs.migrate-command }}
+        TASK_ARN: ${{ steps.task.outputs.task-arn }}
+      run: |
+        set -euo pipefail
+
+        echo "Running pending Django migrations..."
+
+        aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" --container "$CONTAINER" --interactive --command "/bin/sh -lc '$MIGRATE_COMMAND'"
