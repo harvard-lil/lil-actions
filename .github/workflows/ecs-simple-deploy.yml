@@ -30,11 +30,18 @@ on:
       aws-role-arn:
         description: 'IAM role ARN to assume via OIDC (github_role_arn output from Terraform)'
         required: true
+    outputs:
+      full-name:
+        description: 'Resolved app name including environment prefix when provided'
+        value: ${{ jobs.deploy.outputs.full-name }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    outputs:
+      full-name: ${{ steps.name.outputs.full-name }}
+
     permissions:
       id-token: write
       contents: read
@@ -45,6 +52,7 @@ jobs:
 
       - name: Resolve application full name
         id: name
+        shell: bash
         run: |
           if [ -n "${{ inputs.environment }}" ]; then
             echo "full-name=${{ inputs.environment }}-${{ inputs.app-name }}" >> "$GITHUB_OUTPUT"
@@ -67,5 +75,5 @@ jobs:
       - name: Deploy to ECS
         uses: harvard-lil/lil-actions/ecs-deploy@main
         with:
-          cluster: "${{ steps.name.outputs.full-name }}"
-          service: "${{ steps.name.outputs.full-name }}"
+          cluster: ${{ steps.name.outputs.full-name }}
+          service: ${{ steps.name.outputs.full-name }}
