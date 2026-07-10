@@ -18,6 +18,11 @@ inputs:
     required: false
     default: '900'
 
+  poll-interval-seconds:
+    description: 'Seconds to wait between ECS deployment status checks'
+    required: false
+    default: '15'
+
 runs:
   using: composite
   steps:
@@ -27,6 +32,7 @@ runs:
         CLUSTER: ${{ inputs.cluster }}
         SERVICE: ${{ inputs.service }}
         TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
       run: |
         set -euo pipefail
 
@@ -34,26 +40,43 @@ runs:
         echo "Cluster: $CLUSTER"
         echo "Service: $SERVICE"
 
-        timeout "$TIMEOUT_SECONDS" aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+        START_TIME="$(date +%s)"
 
-        SERVICE_JSON="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0]' --output json)"
-        ROLLOUT_STATE="$(echo "$SERVICE_JSON" | jq -r '.deployments[] | select(.status == "PRIMARY") | .rolloutState')"
-        ROLLOUT_REASON="$(echo "$SERVICE_JSON" | jq -r '.deployments[] | select(.status == "PRIMARY") | .rolloutStateReason // ""')"
-        RUNNING_COUNT="$(echo "$SERVICE_JSON" | jq -r '.runningCount')"
-        DESIRED_COUNT="$(echo "$SERVICE_JSON" | jq -r '.desiredCount')"
+        while true; do
+          SERVICE_JSON="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0]' --output json)"
+          ROLLOUT_STATE="$(echo "$SERVICE_JSON" | jq -r '.deployments[] | select(.status == "PRIMARY") | .rolloutState // "UNKNOWN"')"
+          ROLLOUT_REASON="$(echo "$SERVICE_JSON" | jq -r '.deployments[] | select(.status == "PRIMARY") | .rolloutStateReason // ""')"
+          DEPLOYMENT_ID="$(echo "$SERVICE_JSON" | jq -r '.deployments[] | select(.status == "PRIMARY") | .id // ""')"
+          RUNNING_COUNT="$(echo "$SERVICE_JSON" | jq -r '.runningCount')"
+          DESIRED_COUNT="$(echo "$SERVICE_JSON" | jq -r '.desiredCount')"
+          PENDING_COUNT="$(echo "$SERVICE_JSON" | jq -r '.pendingCount')"
 
-        echo "Primary deployment rollout state: $ROLLOUT_STATE"
-        echo "Running tasks: $RUNNING_COUNT / $DESIRED_COUNT"
+          echo "Primary deployment: $DEPLOYMENT_ID"
+          echo "Rollout state: $ROLLOUT_STATE"
+          echo "Running tasks: $RUNNING_COUNT / $DESIRED_COUNT"
+          echo "Pending tasks: $PENDING_COUNT"
 
-        if [ "$ROLLOUT_STATE" != "COMPLETED" ]; then
-          echo "ECS deployment did not complete successfully."
-          echo "$ROLLOUT_REASON"
-          exit 1
-        fi
+          if [ "$ROLLOUT_STATE" = "COMPLETED" ] && [ "$RUNNING_COUNT" = "$DESIRED_COUNT" ] && [ "$PENDING_COUNT" = "0" ]; then
+            echo "ECS deployment completed successfully."
+            exit 0
+          fi
 
-        if [ "$RUNNING_COUNT" != "$DESIRED_COUNT" ]; then
-          echo "ECS service is not running the desired number of tasks."
-          exit 1
-        fi
+          if [ "$ROLLOUT_STATE" = "FAILED" ]; then
+            echo "ECS deployment failed."
+            echo "$ROLLOUT_REASON"
+            exit 1
+          fi
 
-        echo "ECS deployment completed successfully."
+          NOW="$(date +%s)"
+          ELAPSED="$((NOW - START_TIME))"
+
+          if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
+            echo "Timed out waiting for ECS deployment to complete after ${TIMEOUT_SECONDS}s."
+            echo "Last rollout state: $ROLLOUT_STATE"
+            echo "$ROLLOUT_REASON"
+            exit 1
+          fi
+
+          echo "Deployment still in progress. Waiting ${POLL_INTERVAL_SECONDS}s..."
+          sleep "$POLL_INTERVAL_SECONDS"
+        done
