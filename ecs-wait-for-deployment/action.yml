@@ -21,7 +21,7 @@ inputs:
   poll-interval-seconds:
     description: 'Seconds to wait between ECS deployment status checks'
     required: false
-    default: '15'
+    default: '60'
 
 runs:
   using: composite
