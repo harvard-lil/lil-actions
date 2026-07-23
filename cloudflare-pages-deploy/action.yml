@@ -1,0 +1,35 @@
+name: Deploy to Cloudflare Pages
+description: Deploy an already-built static directory to a direct-upload Cloudflare Pages project
+
+inputs:
+  project-name:
+    description: Cloudflare Pages project name
+    required: true
+  directory:
+    description: Directory containing the built static site
+    required: true
+  branch:
+    description: Cloudflare Pages deployment branch; defaults to the GitHub ref name
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy static site
+      shell: bash
+      env:
+        INPUT_PROJECT_NAME: ${{ inputs.project-name }}
+        INPUT_DIRECTORY: ${{ inputs.directory }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+      run: |
+        set -euo pipefail
+        : "${CLOUDFLARE_ACCOUNT_ID:?Set CLOUDFLARE_ACCOUNT_ID in the step environment}"
+        : "${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in the step environment}"
+
+        branch="${INPUT_BRANCH:-${GITHUB_REF_NAME}}"
+        npx --yes wrangler@4.114.0 pages deploy "${INPUT_DIRECTORY}" \
+          --project-name "${INPUT_PROJECT_NAME}" \
+          --branch "${branch}" \
+          --commit-hash "${GITHUB_SHA}" \
+          --commit-dirty=false
