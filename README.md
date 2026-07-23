@@ -10,7 +10,10 @@ Reference them with `uses: harvard-lil/lil-actions/.github/workflows/<workflow-n
 
 ### `ecs-simple-deploy`
 
-Build, push to ECR, and force a new ECS deployment. Covers stateless single-container apps whose task definition is owned by Terraform — CI only does `--force-new-deployment` against the `:latest` tag. Uses OIDC for AWS authentication.
+Build, push to ECR, force a new ECS deployment, and wait for the service to
+become stable. Covers stateless single-container apps whose task definition is
+owned by Terraform — CI only does `--force-new-deployment` against the
+`:latest` tag. Uses OIDC for AWS authentication.
 
 `app-name` must match the Terraform `app_name` variable; the workflow derives the ECR repository, ECS cluster, and ECS service names from `app-name` (and `environment` if set), matching the [`simple-web-app`](https://github.com/harvard-lil/lil-terraform/tree/main/modules/simple-web-app) module's naming.
 
@@ -72,7 +75,10 @@ Updates image tags in `docker-compose.yml` / `docker-compose.override.yml` based
 
 ### `ecs-build`
 
-Logs in to AWS ECR, builds a Docker image, and pushes it tagged with both the commit SHA and a named tag (default: `latest`). AWS credentials must be configured in the calling job before this action runs.
+Logs in to AWS ECR, builds a Docker image, and pushes it tagged with both the
+commit SHA and a named tag (default: `latest`). It outputs both `image-uri`
+(the named tag) and `sha-image-uri` (the immutable commit tag). AWS credentials
+must be configured in the calling job before this action runs.
 
 ### `ecs-register-task-def`
 

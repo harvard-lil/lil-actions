@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: Dockerfile
+      timeout-seconds:
+        description: 'Maximum time to wait for the ECS deployment to become stable'
+        required: false
+        type: string
+        default: '900'
     secrets:
       aws-role-arn:
         description: 'IAM role ARN to assume via OIDC (github_role_arn output from Terraform)'
@@ -77,3 +82,10 @@ jobs:
         with:
           cluster: ${{ steps.name.outputs.full-name }}
           service: ${{ steps.name.outputs.full-name }}
+
+      - name: Wait for ECS deployment
+        uses: harvard-lil/lil-actions/ecs-wait-for-deployment@main
+        with:
+          cluster: ${{ steps.name.outputs.full-name }}
+          service: ${{ steps.name.outputs.full-name }}
+          timeout-seconds: ${{ inputs.timeout-seconds }}

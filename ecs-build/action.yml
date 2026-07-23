@@ -1,8 +1,9 @@
 name: 'Build and push image to AWS ECR'
 description: >
-  Logs in to ECR, builds a Docker image, and pushes it with 
-  a named tag. AWS credentials must be configured in the calling job before this
-  action runs (via aws-actions/configure-aws-credentials).
+  Logs in to ECR, builds a Docker image, and pushes it with both the requested
+  named tag and the immutable GitHub commit SHA. AWS credentials must be
+  configured in the calling job before this action runs (via
+  aws-actions/configure-aws-credentials).
 
 inputs:
   ecr-repository:
@@ -21,6 +22,9 @@ outputs:
   image-uri:
     description: 'Full ECR image URI with the named tag (registry/repository:image-tag)'
     value: ${{ steps.build-push.outputs.image-uri }}
+  sha-image-uri:
+    description: 'Full ECR image URI pinned to the GitHub commit SHA'
+    value: ${{ steps.build-push.outputs.sha-image-uri }}
 
 runs:
   using: composite
@@ -38,6 +42,23 @@ runs:
         IMAGE_TAG: ${{ inputs.image-tag }}
         DOCKERFILE: ${{ inputs.dockerfile }}
       run: |
+        set -euo pipefail
+
         IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
-        docker buildx build --platform linux/amd64 -t "$IMAGE_URI" -f "$DOCKERFILE" --push .
+        SHA_TAG="${GITHUB_SHA:-$IMAGE_TAG}"
+        SHA_IMAGE_URI="$REGISTRY/$REPOSITORY:$SHA_TAG"
+        TAGS=(-t "$IMAGE_URI")
+
+        if [ "$SHA_IMAGE_URI" != "$IMAGE_URI" ]; then
+          TAGS+=(-t "$SHA_IMAGE_URI")
+        fi
+
+        docker buildx build \
+          --platform linux/amd64 \
+          "${TAGS[@]}" \
+          -f "$DOCKERFILE" \
+          --push \
+          .
+
         echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+        echo "sha-image-uri=$SHA_IMAGE_URI" >> "$GITHUB_OUTPUT"
