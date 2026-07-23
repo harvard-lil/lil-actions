@@ -69,6 +69,26 @@ Defaults to `--results=verified,unknown` (flags confirmed-live *and* unverifiabl
 
 Actions are building blocks for more complex deployments. Reference them with `uses: harvard-lil/lil-actions/<action-name>@main`.
 
+### `cloudflare-pages-deploy`
+
+Deploys an already-built static directory to a direct-upload Cloudflare Pages
+project. It centralizes the pinned Wrangler version and commit metadata while
+leaving each repository free to use its own build system.
+
+Set the account ID through the `CLOUDFLARE_ACCOUNT_ID` organization variable and
+provide an API token with Pages Write access through `CLOUDFLARE_API_TOKEN`:
+
+```yaml
+- name: Deploy to Cloudflare Pages
+  uses: harvard-lil/lil-actions/cloudflare-pages-deploy@main
+  with:
+    project-name: example-site
+    directory: dist
+  env:
+    CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+```
+
 ### `docker-compose-update`
 
 Updates image tags in `docker-compose.yml` / `docker-compose.override.yml` based on content hashes, then builds and optionally pushes via `docker buildx bake`. Used by projects that track images in `registry.lil.tools`.
