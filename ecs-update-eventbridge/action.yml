@@ -27,6 +27,9 @@ runs:
           TARGETS=$(aws events list-targets-by-rule --rule "$RULE")
           UPDATED=$(echo "$TARGETS" \
             | jq --arg arn "$TASK_DEF_ARN" \
-              '[.Targets[0] | .EcsParameters.TaskDefinitionArn = $arn | {Id, Arn, RoleArn, Input, EcsParameters}]')
+              '[.Targets[0]
+                | .EcsParameters.TaskDefinitionArn = $arn
+                | {Id, Arn, RoleArn, Input, EcsParameters}
+                | with_entries(select(.value != null))]')
           aws events put-targets --rule "$RULE" --targets "$UPDATED" > /dev/null
         done
