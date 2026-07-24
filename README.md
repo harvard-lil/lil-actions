@@ -75,8 +75,10 @@ Deploys an already-built static directory to a direct-upload Cloudflare Pages
 project. It centralizes the pinned Wrangler version and commit metadata while
 leaving each repository free to use its own build system.
 
-Set the account ID through the `CLOUDFLARE_ACCOUNT_ID` organization variable and
-provide an API token with Pages Write access through `CLOUDFLARE_API_TOKEN`:
+Set the account ID through the `CLOUDFLARE_ACCOUNT_ID` organization variable.
+Store the Pages-only API token in the `CLOUDFLARE_PAGES_TOKEN` organization
+secret, restricted to approved deploy repositories, and map it to Wrangler's
+expected `CLOUDFLARE_API_TOKEN` environment variable:
 
 ```yaml
 - name: Deploy to Cloudflare Pages
@@ -86,7 +88,7 @@ provide an API token with Pages Write access through `CLOUDFLARE_API_TOKEN`:
     directory: dist
   env:
     CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_TOKEN }}
 ```
 
 ### `docker-compose-update`
