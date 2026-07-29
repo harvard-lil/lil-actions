@@ -104,7 +104,11 @@ must be configured in the calling job before this action runs.
 
 ### `ecs-register-task-def`
 
-Fetches the current revision of an ECS task definition, strips read-only fields, optionally updates a container image URI, and registers a new revision. Outputs the new task definition ARN — useful when you need a pinned ARN for EventBridge rules or explicit service updates.
+Fetches the current revision of an ECS task definition, strips read-only fields,
+optionally updates a container image URI and selected container environment
+variables, and registers a new revision. Outputs the new task definition ARN —
+useful when you need a pinned ARN for EventBridge rules or explicit service
+updates.
 
 ### `ecs-update-eventbridge`
 
