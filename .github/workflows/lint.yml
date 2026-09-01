@@ -1,0 +1,54 @@
+# Static analysis for this repo's own code.
+#
+# The composite actions here are pure bash living inside YAML, which means
+# neither shellcheck nor a normal code review sees it as shell. These two jobs
+# make that bash legible to a linter.
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Checks .github/workflows/*.yml: expression syntax, event and permission
+      # names, runner labels, and the shell inside `run:` blocks.
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  shellcheck:
+    name: shellcheck (composite actions)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      # actionlint covers `run:` blocks in workflows but not in composite
+      # action.yml files, so extract those and check them directly. The script
+      # exits non-zero if it finds no bash at all, so a refactor that silently
+      # emptied this check would fail rather than pass.
+      - name: Extract composite action scripts
+        run: python scripts/extract_action_scripts.py "$RUNNER_TEMP/action-scripts"
+
+      - name: Run shellcheck
+        run: shellcheck "$RUNNER_TEMP"/action-scripts/*.sh
