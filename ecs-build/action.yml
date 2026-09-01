@@ -10,9 +10,27 @@ inputs:
     description: 'ECR repository name (not the full URI)'
     required: true
   dockerfile:
-    description: 'Path to Dockerfile'
+    description: >
+      Path to the Dockerfile, relative to the workspace root (not to `context`).
+      When you set a non-default `context` you usually need to set this too.
     required: false
     default: 'Dockerfile'
+  context:
+    description: >
+      Build context directory, relative to the workspace root. Defaults to the
+      repository root. Set this for an image whose build context is a
+      subdirectory, e.g. a Lambda image under docker/<name>/.
+    required: false
+    default: '.'
+  provenance:
+    description: >
+      Passed through to buildx --provenance. Leave empty for buildx's default.
+      Set to "false" for AWS Lambda images: buildx's container driver attaches a
+      provenance attestation, which makes the push an image index, and Lambda
+      rejects those with "The image manifest, config or layer media type for the
+      source image is not supported".
+    required: false
+    default: ''
   image-tag:
     description: 'Named tag to apply'
     required: false
@@ -49,6 +67,8 @@ runs:
         IMAGE_TAG: ${{ inputs.image-tag }}
         DOCKERFILE: ${{ inputs.dockerfile }}
         TARGET: ${{ inputs.target }}
+        CONTEXT: ${{ inputs.context }}
+        PROVENANCE: ${{ inputs.provenance }}
       run: |
         set -euo pipefail
 
@@ -66,13 +86,19 @@ runs:
           TARGET_ARGS=(--target "$TARGET")
         fi
 
+        PROVENANCE_ARGS=()
+        if [ -n "$PROVENANCE" ]; then
+          PROVENANCE_ARGS=(--provenance "$PROVENANCE")
+        fi
+
         docker buildx build \
           --platform linux/amd64 \
           "${TARGET_ARGS[@]}" \
+          "${PROVENANCE_ARGS[@]}" \
           "${TAGS[@]}" \
           -f "$DOCKERFILE" \
           --push \
-          .
+          "$CONTEXT"
 
         echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
         echo "sha-image-uri=$SHA_IMAGE_URI" >> "$GITHUB_OUTPUT"
