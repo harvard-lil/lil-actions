@@ -17,6 +17,13 @@ inputs:
     description: 'Named tag to apply'
     required: false
     default: 'latest'
+  target:
+    description: >
+      Dockerfile stage to build. Leave empty for a single-stage Dockerfile.
+      Set this for any multi-stage Dockerfile: without --target, buildx builds
+      the LAST stage in the file, which is rarely the deployable one.
+    required: false
+    default: ''
 
 outputs:
   image-uri:
@@ -41,6 +48,7 @@ runs:
         REPOSITORY: ${{ inputs.ecr-repository }}
         IMAGE_TAG: ${{ inputs.image-tag }}
         DOCKERFILE: ${{ inputs.dockerfile }}
+        TARGET: ${{ inputs.target }}
       run: |
         set -euo pipefail
 
@@ -53,8 +61,14 @@ runs:
           TAGS+=(-t "$SHA_IMAGE_URI")
         fi
 
+        TARGET_ARGS=()
+        if [ -n "$TARGET" ]; then
+          TARGET_ARGS=(--target "$TARGET")
+        fi
+
         docker buildx build \
           --platform linux/amd64 \
+          "${TARGET_ARGS[@]}" \
           "${TAGS[@]}" \
           -f "$DOCKERFILE" \
           --push \
