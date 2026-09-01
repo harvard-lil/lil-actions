@@ -65,13 +65,14 @@ runs:
         BUILD_COMMAND="docker buildx bake -f docker-compose.yml -f docker-compose.override.yml ${{ steps.update-tags.outputs.services-to-rebuild }} \
                       --set *.cache-to=type=local,mode=max,dest=/tmp/.buildx-cache --set *.cache-from=type=local,src=/tmp/.buildx-cache"
 
-        if [ "${{ github.event_name }}" != "push" ] || [ "${{ inputs.bake-action }}" == "load" ]; then
-          # just build for local tests on PRs
+        # Push when the caller asked for it, except from a pull_request, where a
+        # fork's code must never reach the registry. Keying this on the event
+        # being exactly "push" meant workflow_dispatch silently built and threw
+        # the result away, so a manual rebuild could not publish anything.
+        if [ "${{ inputs.bake-action }}" != "push" ] || [ "${{ github.event_name }}" == "pull_request" ]; then
+          # just build, for local tests on PRs
           $BUILD_COMMAND --load --set "*.platform=linux/amd64"
-        elif [ "${{ github.event_name }}" == "push" ]; then
-          # build for all platforms and push to registry on pushes
-          $BUILD_COMMAND --push
         else
-          echo "Unknown bake action: ${{ inputs.bake-action }}"
-          exit 1
+          # build for all platforms and push to registry
+          $BUILD_COMMAND --push
         fi
