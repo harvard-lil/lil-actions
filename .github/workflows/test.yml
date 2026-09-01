@@ -1,0 +1,39 @@
+# CI for this repo's own code.
+#
+# The other workflows here are `workflow_call` only -- they are pipelines this
+# repo offers to other repos, and none of them run against lil-actions itself.
+# That left docker-compose-update/test_update_tags.py never executing anywhere.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-compose-update:
+    name: docker-compose-update
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docker-compose-update
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # test_main writes to $GITHUB_OUTPUT, which Actions sets for us. Running
+      # this suite locally without that variable fails on KeyError.
+      - name: Run tests
+        run: pytest -v
