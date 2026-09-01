@@ -127,3 +127,93 @@ def github_output():
     return Path(
         os.environ['GITHUB_OUTPUT']
     ).read_text().rstrip().split('\n')[-1]
+
+
+### remote_tag_exists ###
+
+class FakeResponse:
+    """Minimal stand-in for requests.Response."""
+
+    def __init__(self, status_code, json_body=None, headers=None):
+        self.status_code = status_code
+        self._json_body = json_body
+        self.headers = headers or {}
+
+    def json(self):
+        return self._json_body
+
+
+def fake_get(responses):
+    """Return a requests.get replacement that pops from `responses` and records calls."""
+    calls = []
+
+    def _get(url, params=None, headers=None):
+        calls.append({'url': url, 'params': params, 'headers': headers})
+        return responses.pop(0)
+
+    _get.calls = calls
+    return _get
+
+
+def test_remote_tag_exists_when_registry_allows_anonymous_reads(monkeypatch):
+    # Harbor answered /tags/list directly, with no token exchange.
+    get = fake_get([FakeResponse(200, {'name': 'project/image', 'tags': ['0.01', '0.02']})])
+    monkeypatch.setattr(update_tags.requests, 'get', get)
+
+    assert update_tags.remote_tag_exists('example.com/project/image:0.01') is True
+    assert get.calls[0]['url'] == 'https://example.com/v2/project/image/tags/list'
+
+
+def test_remote_tag_exists_false_when_tag_absent(monkeypatch):
+    monkeypatch.setattr(update_tags.requests, 'get',
+                        fake_get([FakeResponse(200, {'tags': ['0.02']})]))
+    assert update_tags.remote_tag_exists('example.com/project/image:0.01') is False
+
+
+def test_remote_tag_exists_follows_bearer_challenge(monkeypatch):
+    # GHCR returns 401 even for public packages, and only answers once we have
+    # exchanged the WWW-Authenticate challenge for a token.
+    challenge = (
+        'Bearer realm="https://ghcr.io/token",service="ghcr.io",'
+        'scope="repository:harvard-lil/h2o-python:pull"'
+    )
+    get = fake_get([
+        FakeResponse(401, {'errors': [{'code': 'UNAUTHORIZED'}]},
+                     headers={'www-authenticate': challenge}),
+        FakeResponse(200, {'token': 'sekrit'}),
+        FakeResponse(200, {'tags': ['0.118-abc']}),
+    ])
+    monkeypatch.setattr(update_tags.requests, 'get', get)
+
+    assert update_tags.remote_tag_exists('ghcr.io/harvard-lil/h2o-python:0.118-abc') is True
+
+    # asked the realm for the service and scope it named, then retried with the token
+    assert get.calls[1]['url'] == 'https://ghcr.io/token'
+    assert get.calls[1]['params'] == {
+        'service': 'ghcr.io',
+        'scope': 'repository:harvard-lil/h2o-python:pull',
+    }
+    assert get.calls[2]['headers'] == {'Authorization': 'Bearer sekrit'}
+
+
+def test_remote_tag_exists_false_when_challenge_cannot_be_answered(monkeypatch):
+    # Previously this raised KeyError('tags') on the 401 body, failing the whole
+    # workflow rather than reporting the tag missing.
+    monkeypatch.setattr(update_tags.requests, 'get', fake_get([
+        FakeResponse(401, {'errors': [{'code': 'UNAUTHORIZED'}]},
+                     headers={'www-authenticate': 'Bearer realm="https://ghcr.io/token"'}),
+        FakeResponse(403, {}),
+    ]))
+    assert update_tags.remote_tag_exists('ghcr.io/harvard-lil/private:0.01') is False
+
+
+def test_remote_tag_exists_false_for_missing_repository(monkeypatch):
+    monkeypatch.setattr(update_tags.requests, 'get', fake_get([FakeResponse(404, {})]))
+    assert update_tags.remote_tag_exists('example.com/project/nope:0.01') is False
+
+
+def test_remote_tag_exists_handles_null_tags(monkeypatch):
+    # A registry with an empty repository may return {"name": ..., "tags": null}.
+    monkeypatch.setattr(update_tags.requests, 'get',
+                        fake_get([FakeResponse(200, {'name': 'project/image', 'tags': None})]))
+    assert update_tags.remote_tag_exists('example.com/project/image:0.01') is False

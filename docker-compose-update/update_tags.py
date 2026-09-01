@@ -72,22 +72,68 @@ def get_changed_tags(override_path, override_text):
     return changed_tags, all_services
 
 
+def anonymous_bearer_token(www_authenticate):
+    """Get an anonymous bearer token from the realm named in a WWW-Authenticate header.
+
+    The header looks like:
+        Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:org/img:pull"
+    We hand realm the service and scope it asked for and get a token back.
+    Returns None if the header isn't a Bearer challenge or the token request fails.
+    """
+    if not www_authenticate.lower().startswith('bearer '):
+        return None
+
+    params = {}
+    for part in www_authenticate[len('bearer '):].split(','):
+        key, sep, value = part.partition('=')
+        if sep:
+            params[key.strip()] = value.strip().strip('"')
+
+    realm = params.pop('realm', None)
+    if not realm:
+        return None
+
+    r = requests.get(realm, params=params)
+    if r.status_code != 200:
+        return None
+    body = r.json()
+    # GHCR returns "token"; some registries return "access_token".
+    return body.get('token') or body.get('access_token')
+
+
 def remote_tag_exists(tag):
-    """Check if a remote docker tag exists."""
+    """Check if a remote docker tag exists.
+
+    Registries implement the Docker Registry v2 auth flow: an unauthenticated
+    request is answered with 401 plus a WWW-Authenticate header naming a token
+    endpoint, and the real request is retried with that token. Harbor happened to
+    serve anonymous reads directly, so this used to work without the round trip;
+    GHCR returns 401 even for public packages, so the round trip is required.
+    """
     # the full tag is something like example.com/project/image:0.01
-    # and the curl command from https://stackoverflow.com/a/65826563 needs
-    # https://example.com/v2/project/image/tags/list
+    # and we need https://example.com/v2/project/image/tags/list
     remote, version = tag.split(':')
     host, repository = remote.split('/', 1)
 
     # can we assume https?
-    r = requests.get(f'https://{host}/v2/{repository}/tags/list')
-    if r.status_code == 404:
-        # this repository doesn't exist yet; there may be other conditions
-        # we should check here
+    url = f'https://{host}/v2/{repository}/tags/list'
+    r = requests.get(url)
+
+    if r.status_code == 401:
+        token = anonymous_bearer_token(r.headers.get('www-authenticate', ''))
+        if token:
+            r = requests.get(url, headers={'Authorization': f'Bearer {token}'})
+
+    if r.status_code != 200:
+        # 404 means the repository doesn't exist yet. A 401 that survived the
+        # token exchange means it is private or absent and we can't see it.
+        # Either way we can't confirm the tag, so report it missing and let the
+        # caller rebuild -- pushing an image that already exists is harmless,
+        # whereas skipping a needed build is not.
         return False
-    else:
-        return version in r.json()['tags']
+
+    # A registry with no tags may return {"name": ..., "tags": null}.
+    return version in (r.json().get('tags') or [])
 
 
 def main(docker_compose_path='docker-compose.yml', action='load'):
