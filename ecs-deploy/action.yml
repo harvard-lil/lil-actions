@@ -1,7 +1,8 @@
 name: 'Deploy ECS service'
 
 description: >
-  Forces a new deployment of an existing ECS service.
+  Forces a new deployment of an existing ECS service, optionally moving it to a
+  specific task definition revision.
 
 inputs:
   cluster:
@@ -12,6 +13,19 @@ inputs:
     description: 'ECS service name'
     required: true
 
+  task-definition:
+    description: >
+      Task definition ARN to deploy, e.g. the output of ecs-register-task-def.
+      Omit for services whose task definition is owned by Terraform and pinned
+      to a moving tag, where --force-new-deployment alone re-pulls the image.
+    required: false
+    default: ''
+
+outputs:
+  task-definition:
+    description: 'Task definition the service is now running'
+    value: ${{ steps.deploy.outputs.task-definition }}
+
 runs:
   using: composite
   steps:
@@ -21,5 +35,22 @@ runs:
       env:
         CLUSTER: ${{ inputs.cluster }}
         SERVICE: ${{ inputs.service }}
+        TASK_DEFINITION: ${{ inputs.task-definition }}
       run: |
-        aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --query 'service.deployments' --output json
+        set -euo pipefail
+
+        TASK_DEF_ARGS=()
+        if [ -n "$TASK_DEFINITION" ]; then
+          TASK_DEF_ARGS=(--task-definition "$TASK_DEFINITION")
+        fi
+
+        deployed="$(aws ecs update-service \
+          --cluster "$CLUSTER" \
+          --service "$SERVICE" \
+          "${TASK_DEF_ARGS[@]}" \
+          --force-new-deployment \
+          --query 'service.taskDefinition' \
+          --output text)"
+
+        echo "Service $SERVICE now on $deployed"
+        echo "task-definition=$deployed" >> "$GITHUB_OUTPUT"
