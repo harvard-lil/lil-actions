@@ -1,0 +1,78 @@
+name: 'Add a tag to an image already in ECR'
+description: >
+  Adds an additional tag to an image that is already in an ECR repository,
+  without pulling or re-pushing it. Used to mark the subset of build candidates
+  that a deploy actually promoted, so that retention policies can keep deployed
+  images and disposable candidates for different lengths of time.
+
+  Works on repositories with immutable tags: immutability forbids pointing an
+  existing tag at a different image, not adding a new tag to an existing one.
+
+inputs:
+  repository:
+    description: 'ECR repository name'
+    required: true
+  source:
+    description: 'The image to tag, as either a sha256: digest or an existing tag'
+    required: true
+  tag:
+    description: 'The tag to add'
+    required: true
+
+outputs:
+  digest:
+    description: 'Digest of the image that was tagged'
+    value: ${{ steps.tag.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Add the tag
+      id: tag
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        SOURCE: ${{ inputs.source }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        case "$SOURCE" in
+          sha256:*) IMAGE_ID="imageDigest=$SOURCE" ;;
+          *)        IMAGE_ID="imageTag=$SOURCE" ;;
+        esac
+
+        # Read the manifest rather than the image. Re-registering the same
+        # manifest bytes under an additional tag moves no layers and, crucially,
+        # leaves the digest alone -- `docker buildx imagetools create` would wrap
+        # a single-platform manifest in a new index instead, changing the digest
+        # and leaving a second manifest behind for retention to step around.
+        DIGEST=$(aws ecr describe-images --repository-name "$REPOSITORY" \
+          --image-ids "$IMAGE_ID" --query 'imageDetails[0].imageDigest' --output text)
+        if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
+          echo "::error::No image '$SOURCE' in repository '$REPOSITORY'."
+          exit 1
+        fi
+        echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+        # A re-run of a deploy reaches this with the tag already in place. That
+        # is success, not a conflict -- but PutImage reports it as an error, so
+        # check first rather than letting it fail the deploy.
+        EXISTING=$(aws ecr describe-images --repository-name "$REPOSITORY" \
+          --image-ids "imageTag=$TAG" --query 'imageDetails[0].imageDigest' \
+          --output text 2>/dev/null) || EXISTING=""
+        if [ "$EXISTING" = "$DIGEST" ]; then
+          echo "$REPOSITORY:$TAG already points at $DIGEST"
+          exit 0
+        fi
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+          echo "::error::$REPOSITORY:$TAG already exists and points at $EXISTING,"
+          echo "::error::not the $DIGEST being deployed. Refusing to guess."
+          exit 1
+        fi
+
+        MANIFEST=$(aws ecr batch-get-image --repository-name "$REPOSITORY" \
+          --image-ids "imageDigest=$DIGEST" --query 'images[0].imageManifest' --output text)
+        aws ecr put-image --repository-name "$REPOSITORY" --image-tag "$TAG" \
+          --image-manifest "$MANIFEST" >/dev/null
+        echo "Tagged $DIGEST as $REPOSITORY:$TAG"
