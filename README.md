@@ -102,6 +102,16 @@ commit SHA and a named tag (default: `latest`). It outputs both `image-uri`
 (the named tag) and `sha-image-uri` (the immutable commit tag). AWS credentials
 must be configured in the calling job before this action runs.
 
+### `ecr-tag-image`
+
+Adds an extra tag to an image already in ECR, by re-registering its manifest
+rather than pulling and re-pushing. Layers do not move and the digest is
+unchanged. Use it at deploy time to mark which build candidates were actually
+promoted, so a lifecycle policy can keep deployed images longer than the
+candidate churn around them. Safe on repositories with immutable tags — adding a
+new tag is permitted, only repointing an existing one is not — and idempotent
+when a deploy is re-run.
+
 ### `ecs-register-task-def`
 
 Fetches the current revision of an ECS task definition, strips read-only fields,
