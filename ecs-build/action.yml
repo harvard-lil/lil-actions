@@ -24,13 +24,16 @@ inputs:
     default: '.'
   provenance:
     description: >
-      Passed through to buildx --provenance. Leave empty for buildx's default.
-      Set to "false" for AWS Lambda images: buildx's container driver attaches a
-      provenance attestation, which makes the push an image index, and Lambda
-      rejects those with "The image manifest, config or layer media type for the
-      source image is not supported".
+      Passed through to buildx --provenance. Defaults to "false", which is what
+      every caller has effectively been getting: the docker driver attaches no
+      attestations, so nothing published through this action has ever been an
+      image index. Now that a container-driver builder is set up above, buildx's
+      own default would start attaching provenance -- turning each push into an
+      index, changing its digest, and breaking AWS Lambda, which rejects those
+      with "The image manifest, config or layer media type for the source image
+      is not supported". Set it explicitly to opt in.
     required: false
-    default: ''
+    default: 'false'
   image-tag:
     description: >
       Named tag to apply alongside the commit SHA. Set to an empty string to
@@ -58,6 +61,22 @@ outputs:
 runs:
   using: composite
   steps:
+    # Build on a builder this action created, not on whatever the calling job
+    # happens to have left as the default. Without this, adding a
+    # setup-buildx-action step anywhere in a caller's workflow silently changes
+    # the driver this build runs on -- which is exactly what happened to h2o,
+    # moving its pandoc-lambda build from the docker driver to a container one
+    # as a side effect of an unrelated change.
+    #
+    # `use: false` keeps that symmetric: this does not become the caller's
+    # default either. The generated name is unique, so a job may call this
+    # action more than once.
+    - name: Set up a builder for this build
+      id: buildx
+      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      with:
+        use: false
+
     - name: Login to AWS ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
@@ -73,6 +92,7 @@ runs:
         TARGET: ${{ inputs.target }}
         CONTEXT: ${{ inputs.context }}
         PROVENANCE: ${{ inputs.provenance }}
+        BUILDER: ${{ steps.buildx.outputs.name }}
       run: |
         set -euo pipefail
 
@@ -104,6 +124,7 @@ runs:
         fi
 
         docker buildx build \
+          --builder "$BUILDER" \
           --platform linux/amd64 \
           "${TARGET_ARGS[@]}" \
           "${PROVENANCE_ARGS[@]}" \

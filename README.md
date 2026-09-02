@@ -102,6 +102,14 @@ commit SHA and a named tag (default: `latest`). It outputs both `image-uri`
 (the named tag) and `sha-image-uri` (the immutable commit tag). AWS credentials
 must be configured in the calling job before this action runs.
 
+### `cloudflare-purge`
+
+Purges a Cloudflare zone's cache after a deploy, with a direct API call. Pass
+`files` to purge specific URLs instead of the whole zone. Replaces
+`jakejarvis/cloudflare-purge-action`, which was archived, last committed in 2019,
+referenced by branch, and rebuilt from a floating base image on every run while
+holding a Cloudflare API token.
+
 ### `ecr-tag-image`
 
 Adds an extra tag to an image already in ECR, by re-registering its manifest
