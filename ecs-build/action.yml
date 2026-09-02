@@ -32,7 +32,11 @@ inputs:
     required: false
     default: ''
   image-tag:
-    description: 'Named tag to apply'
+    description: >
+      Named tag to apply alongside the commit SHA. Set to an empty string to
+      push only the SHA tag -- required for a repository with immutable tags,
+      where re-pushing a moving tag like `latest` fails the build, and sensible
+      anywhere the named tag has no consumer.
     required: false
     default: 'latest'
   target:
@@ -72,13 +76,21 @@ runs:
       run: |
         set -euo pipefail
 
-        IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
-        SHA_TAG="${GITHUB_SHA:-$IMAGE_TAG}"
+        SHA_TAG="${GITHUB_SHA:-${IMAGE_TAG:-latest}}"
         SHA_IMAGE_URI="$REGISTRY/$REPOSITORY:$SHA_TAG"
-        TAGS=(-t "$IMAGE_URI")
 
-        if [ "$SHA_IMAGE_URI" != "$IMAGE_URI" ]; then
-          TAGS+=(-t "$SHA_IMAGE_URI")
+        # The SHA tag is always applied; it is the one that identifies the build.
+        TAGS=(-t "$SHA_IMAGE_URI")
+
+        if [ -n "$IMAGE_TAG" ]; then
+          IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          if [ "$IMAGE_URI" != "$SHA_IMAGE_URI" ]; then
+            TAGS+=(-t "$IMAGE_URI")
+          fi
+        else
+          # No named tag requested, so the SHA tag is the only one and is what
+          # the image-uri output reports.
+          IMAGE_URI="$SHA_IMAGE_URI"
         fi
 
         TARGET_ARGS=()
