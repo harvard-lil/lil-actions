@@ -1,0 +1,65 @@
+name: 'Purge a Cloudflare zone cache'
+description: >
+  Purges a Cloudflare zone's cache after a deploy, by calling the Cloudflare API
+  directly.
+
+  This exists to replace jakejarvis/cloudflare-purge-action, which several repos
+  used. That action was archived, last committed in 2019, referenced by branch
+  rather than tag, and built from a floating `alpine:latest` on every run -- all
+  while holding a Cloudflare API token. The work it did was a single API call.
+
+inputs:
+  zone:
+    description: 'Cloudflare zone ID'
+    required: true
+  token:
+    description: 'Cloudflare API token with the Zone.Cache Purge permission'
+    required: true
+  files:
+    description: >
+      Optional JSON array of specific URLs to purge, e.g. '["https://example.org/a"]'.
+      Everything in the zone is purged when this is omitted.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Purge
+      shell: bash
+      env:
+        ZONE: ${{ inputs.zone }}
+        TOKEN: ${{ inputs.token }}
+        FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$ZONE" ] || [ -z "$TOKEN" ]; then
+          echo "::error::Both zone and token are required."
+          exit 1
+        fi
+
+        if [ -n "$FILES" ]; then
+          BODY=$(jq -cn --argjson files "$FILES" '{files: $files}')
+        else
+          BODY='{"purge_everything":true}'
+        fi
+
+        # Keep the status and the body separate so a failure can be reported
+        # with Cloudflare's own error text rather than a bare exit code.
+        RESPONSE=$(mktemp)
+        STATUS=$(curl -sS -o "$RESPONSE" -w '%{http_code}' \
+          -X POST "https://api.cloudflare.com/client/v4/zones/${ZONE}/purge_cache" \
+          -H "Authorization: Bearer ${TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "$BODY")
+
+        # Cloudflare answers 200 with "success": false for some failures, so the
+        # status code alone is not enough to call this done.
+        if [ "$STATUS" != "200" ] || [ "$(jq -r '.success' < "$RESPONSE")" != "true" ]; then
+          echo "::error::Cloudflare purge failed (HTTP $STATUS)"
+          jq -r '.errors // .' < "$RESPONSE" >&2 || cat "$RESPONSE" >&2
+          exit 1
+        fi
+
+        echo "Purged Cloudflare cache for zone ${ZONE}."
