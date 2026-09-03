@@ -28,7 +28,9 @@ inputs:
     description: 'Comma-separated hostnames, e.g. opencasebook.org,www.opencasebook.org'
     required: true
   token:
-    description: 'Cloudflare API token with Zone Workers Routes:Edit'
+    description: >
+      Cloudflare API token. Needs Zone Workers Routes: Edit on the zone, plus
+      account-scoped Workers Scripts: Read for the mode 'on' script check.
     required: true
   account-id:
     description: 'Cloudflare account ID; required for the script existence check'
@@ -69,11 +71,57 @@ runs:
           *) echo "::error::mode must be 'on' or 'off', got '$MODE'." ; exit 1 ;;
         esac
 
+        # One Cloudflare call. Leaves the status in CF_STATUS and the response
+        # body in CF_BODY, and returns non-zero for anything outside 2xx.
+        #
+        # The status is what tells an absent resource apart from a token that is
+        # not allowed to look for it, so callers read it here instead of using
+        # curl --fail-with-body, which reports every 4xx and 5xx as exit 22.
         cf() {
           local method="$1" path="$2"; shift 2
-          curl -sS --fail-with-body -X "$method" "${API}${path}" \
+          local body_file; body_file="$(mktemp)"
+          CF_STATUS="$(curl -sS -o "$body_file" -w '%{http_code}' \
+            -X "$method" "${API}${path}" \
             -H "Authorization: Bearer ${CF_TOKEN}" \
-            -H "Content-Type: application/json" "$@"
+            -H "Content-Type: application/json" "$@")" || CF_STATUS=000
+          CF_BODY="$(cat "$body_file")"
+          rm -f "$body_file"
+          case "$CF_STATUS" in
+            2??) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        # Reports the failure a cf() call just hit: what was being attempted,
+        # the token scope that would allow it, and what Cloudflare said. The
+        # optional third argument is extra context about a resource that is not
+        # there, printed on 404.
+        cf_fail() {
+          local what="$1" scope="$2" hint="${3:-}"
+          case "$CF_STATUS" in
+            401|403)
+              echo "::error::Not allowed to ${what}."
+              echo "::error::This needs a token carrying ${scope}."
+              ;;
+            404)
+              echo "::error::Could not ${what}: Cloudflare answered 404, which it uses both"
+              echo "::error::for a thing that is absent and for one the token cannot see."
+              echo "::error::Check the account, zone, and resource ids in the inputs, and"
+              echo "::error::check that the token carries ${scope}."
+              if [ -n "$hint" ]; then
+                echo "::error::${hint}"
+              fi
+              ;;
+            000)
+              echo "::error::No response from Cloudflare while trying to ${what}."
+              ;;
+            *)
+              echo "::error::Trying to ${what} returned HTTP ${CF_STATUS}."
+              ;;
+          esac
+          if [ -n "$CF_BODY" ]; then
+            echo "::error::Cloudflare said: $(printf '%s' "$CF_BODY" | tr -s '[:space:]' ' ' | cut -c1-400)"
+          fi
         }
 
         IFS=',' read -ra HOSTS <<< "$HOSTNAMES"
@@ -89,45 +137,23 @@ runs:
           fi
           # Fail on a stale or mistyped name here, rather than leaving the
           # confirmation loop to report the vaguer "the page never appeared".
-          #
-          # Not cf(), because --fail-with-body cannot say which failure this
-          # was, and a token that may not read the account fails exactly like a
-          # Worker that does not exist. Those want different fixes, so read the
-          # status and say which one happened.
-          RESP="$(mktemp)"
-          STATUS="$(curl -sS -o "$RESP" -w '%{http_code}' \
-            -X GET "${API}/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}" \
-            -H "Authorization: Bearer ${CF_TOKEN}")" || STATUS=000
-          detail() { tr -s '[:space:]' ' ' < "$RESP" | cut -c1-400; }
-          case "$STATUS" in
-            2??)
-              rm -f "$RESP"
-              ;;
-            401|403)
-              echo "::error::Not allowed to read Workers scripts in account ${ACCOUNT_ID}."
-              echo "::error::This needs an account-scoped token with Workers Scripts: Read."
-              echo "::error::A zone-scoped token cannot answer it even when the Worker exists."
-              echo "::error::Cloudflare said: $(detail)"
-              exit 1
-              ;;
-            404)
-              echo "::error::No Worker named '${SCRIPT}' in account ${ACCOUNT_ID}, or the"
-              echo "::error::token cannot see that account. Cloudflare returns 404 for both."
-              echo "::error::The Worker is created by lil-terraform's lil-cloudflare-maintenance module."
-              echo "::error::Cloudflare said: $(detail)"
-              exit 1
-              ;;
-            *)
-              echo "::error::Checking for Worker '${SCRIPT}' returned HTTP ${STATUS}."
-              echo "::error::Cloudflare said: $(detail)"
-              exit 1
-              ;;
-          esac
+          if ! cf GET "/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}"; then
+            cf_fail "read Worker '${SCRIPT}' in account ${ACCOUNT_ID}" \
+              "account-scoped Workers Scripts: Read, which a zone-scoped token does not have" \
+              "The Worker is created by lil-terraform's lil-cloudflare-maintenance module."
+            exit 1
+          fi
         fi
 
-        existing="$(cf GET "/zones/${ZONE_ID}/workers/routes")"
+        if ! cf GET "/zones/${ZONE_ID}/workers/routes"; then
+          cf_fail "list Workers routes for zone ${ZONE_ID}" \
+            "Zone Workers Routes: Read on that zone" \
+            "Check zone-id against the zone the hostnames actually live in."
+          exit 1
+        fi
+        existing="$CF_BODY"
         if ! jq -e '.success == true' <<< "$existing" >/dev/null; then
-          echo "::error::Could not list Workers routes for zone ${ZONE_ID}."
+          echo "::error::Listing Workers routes for zone ${ZONE_ID} returned HTTP ${CF_STATUS} with success false."
           jq -c '.errors // .' <<< "$existing" >&2 || echo "$existing" >&2
           exit 1
         fi
@@ -141,15 +167,24 @@ runs:
               echo "route already present for $pattern"
               continue
             fi
-            cf POST "/zones/${ZONE_ID}/workers/routes" \
-              --data "$(jq -cn --arg p "$pattern" --arg s "$SCRIPT" '{pattern:$p, script:$s}')" >/dev/null
+            if ! cf POST "/zones/${ZONE_ID}/workers/routes" \
+              --data "$(jq -cn --arg p "$pattern" --arg s "$SCRIPT" '{pattern:$p, script:$s}')"; then
+              cf_fail "create a Workers route for ${pattern}" \
+                "Zone Workers Routes: Edit on zone ${ZONE_ID}"
+              exit 1
+            fi
             echo "holding $pattern -> $SCRIPT"
           else
             if [ -z "$route_id" ]; then
               echo "no route for $pattern; nothing to release"
               continue
             fi
-            cf DELETE "/zones/${ZONE_ID}/workers/routes/${route_id}" >/dev/null
+            if ! cf DELETE "/zones/${ZONE_ID}/workers/routes/${route_id}"; then
+              cf_fail "delete Workers route ${route_id} for ${pattern}" \
+                "Zone Workers Routes: Edit on zone ${ZONE_ID}" \
+                "The route was in the listing a moment ago; another run may have removed it."
+              exit 1
+            fi
             echo "released $pattern"
           fi
         done
