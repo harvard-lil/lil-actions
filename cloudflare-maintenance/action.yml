@@ -89,11 +89,40 @@ runs:
           fi
           # Fail on a stale or mistyped name here, rather than leaving the
           # confirmation loop to report the vaguer "the page never appeared".
-          if ! cf GET "/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}" -o /dev/null; then
-            echo "::error::No Worker named '${SCRIPT}' in account ${ACCOUNT_ID}."
-            echo "::error::It is created by lil-terraform's lil-cloudflare-maintenance module."
-            exit 1
-          fi
+          #
+          # Not cf(), because --fail-with-body cannot say which failure this
+          # was, and a token that may not read the account fails exactly like a
+          # Worker that does not exist. Those want different fixes, so read the
+          # status and say which one happened.
+          RESP="$(mktemp)"
+          STATUS="$(curl -sS -o "$RESP" -w '%{http_code}' \
+            -X GET "${API}/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}" \
+            -H "Authorization: Bearer ${CF_TOKEN}")" || STATUS=000
+          detail() { tr -s '[:space:]' ' ' < "$RESP" | cut -c1-400; }
+          case "$STATUS" in
+            2??)
+              rm -f "$RESP"
+              ;;
+            401|403)
+              echo "::error::Not allowed to read Workers scripts in account ${ACCOUNT_ID}."
+              echo "::error::This needs an account-scoped token with Workers Scripts: Read."
+              echo "::error::A zone-scoped token cannot answer it even when the Worker exists."
+              echo "::error::Cloudflare said: $(detail)"
+              exit 1
+              ;;
+            404)
+              echo "::error::No Worker named '${SCRIPT}' in account ${ACCOUNT_ID}, or the"
+              echo "::error::token cannot see that account. Cloudflare returns 404 for both."
+              echo "::error::The Worker is created by lil-terraform's lil-cloudflare-maintenance module."
+              echo "::error::Cloudflare said: $(detail)"
+              exit 1
+              ;;
+            *)
+              echo "::error::Checking for Worker '${SCRIPT}' returned HTTP ${STATUS}."
+              echo "::error::Cloudflare said: $(detail)"
+              exit 1
+              ;;
+          esac
         fi
 
         existing="$(cf GET "/zones/${ZONE_ID}/workers/routes")"
