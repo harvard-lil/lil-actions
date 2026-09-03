@@ -1,0 +1,150 @@
+name: 'Cloudflare maintenance page'
+description: >
+  Holds traffic at Cloudflare's edge by pointing a route at a maintenance
+  Worker, or releases it by deleting that route, and then confirms the change by
+  requesting the site.
+
+  Held at the edge rather than at the origin, so it still works when the origin
+  is gone -- which is the situation a maintenance page is most wanted in.
+
+  The Worker and page are managed in Terraform (lil-terraform's
+  lil-cloudflare-maintenance module). This action only attaches and detaches.
+
+inputs:
+  mode:
+    description: "'on' to hold traffic, 'off' to release it"
+    required: true
+  zone-id:
+    description: 'Cloudflare zone containing the hostnames'
+    required: true
+  script:
+    description: >
+      Worker script name to route traffic to, e.g. h2o-maintenance-prod.
+      Only used for mode: on. Checked for existence first, so a stale name
+      fails here rather than as a page that never appears.
+    required: false
+    default: ''
+  hostnames:
+    description: 'Comma-separated hostnames, e.g. opencasebook.org,www.opencasebook.org'
+    required: true
+  token:
+    description: 'Cloudflare API token with Zone Workers Routes:Edit'
+    required: true
+  account-id:
+    description: 'Cloudflare account ID; required for the script existence check'
+    required: false
+    default: '1e8159697c2f0b09bd8fc9f9f4a80e80'
+  confirm:
+    description: >
+      Request the site afterwards until the change is visible, and fail if it
+      never is. Leave this on: a window that cannot be confirmed to have started
+      is worse than none, because the work it covers proceeds anyway.
+    required: false
+    default: 'true'
+  confirm-attempts:
+    description: 'How many times to check before giving up'
+    required: false
+    default: '15'
+
+runs:
+  using: composite
+  steps:
+    - name: ${{ inputs.mode == 'on' && 'Hold traffic at Cloudflare' || 'Release traffic at Cloudflare' }}
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        ZONE_ID: ${{ inputs.zone-id }}
+        SCRIPT: ${{ inputs.script }}
+        HOSTNAMES: ${{ inputs.hostnames }}
+        CF_TOKEN: ${{ inputs.token }}
+        ACCOUNT_ID: ${{ inputs.account-id }}
+        CONFIRM: ${{ inputs.confirm }}
+        ATTEMPTS: ${{ inputs.confirm-attempts }}
+      run: |
+        set -euo pipefail
+        API=https://api.cloudflare.com/client/v4
+
+        case "$MODE" in
+          on|off) ;;
+          *) echo "::error::mode must be 'on' or 'off', got '$MODE'." ; exit 1 ;;
+        esac
+
+        cf() {
+          local method="$1" path="$2"; shift 2
+          curl -sS --fail-with-body -X "$method" "${API}${path}" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" "$@"
+        }
+
+        IFS=',' read -ra HOSTS <<< "$HOSTNAMES"
+        if [ "${#HOSTS[@]}" -eq 0 ]; then
+          echo "::error::No hostnames given."
+          exit 1
+        fi
+
+        if [ "$MODE" = "on" ]; then
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::mode 'on' needs a script name."
+            exit 1
+          fi
+          # Fail on a stale or mistyped name here, rather than leaving the
+          # confirmation loop to report the vaguer "the page never appeared".
+          if ! cf GET "/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}" -o /dev/null; then
+            echo "::error::No Worker named '${SCRIPT}' in account ${ACCOUNT_ID}."
+            echo "::error::It is created by lil-terraform's lil-cloudflare-maintenance module."
+            exit 1
+          fi
+        fi
+
+        existing="$(cf GET "/zones/${ZONE_ID}/workers/routes")"
+        if ! jq -e '.success == true' <<< "$existing" >/dev/null; then
+          echo "::error::Could not list Workers routes for zone ${ZONE_ID}."
+          jq -c '.errors // .' <<< "$existing" >&2 || echo "$existing" >&2
+          exit 1
+        fi
+
+        for host in "${HOSTS[@]}"; do
+          pattern="${host}/*"
+          route_id="$(jq -r --arg p "$pattern" '(.result // [])[] | select(.pattern == $p) | .id' <<< "$existing" | head -n1)"
+
+          if [ "$MODE" = "on" ]; then
+            if [ -n "$route_id" ]; then
+              echo "route already present for $pattern"
+              continue
+            fi
+            cf POST "/zones/${ZONE_ID}/workers/routes" \
+              --data "$(jq -cn --arg p "$pattern" --arg s "$SCRIPT" '{pattern:$p, script:$s}')" >/dev/null
+            echo "holding $pattern -> $SCRIPT"
+          else
+            if [ -z "$route_id" ]; then
+              echo "no route for $pattern; nothing to release"
+              continue
+            fi
+            cf DELETE "/zones/${ZONE_ID}/workers/routes/${route_id}" >/dev/null
+            echo "released $pattern"
+          fi
+        done
+
+        if [ "$CONFIRM" != "true" ]; then
+          echo "::warning::Not confirming; confirm was set to '${CONFIRM}'."
+          exit 0
+        fi
+
+        # Route changes land within seconds and uniformly, so an observation
+        # here is meaningful rather than a sample of one edge location.
+        host="${HOSTS[0]}"
+        echo "Confirming against ${host}..."
+        for attempt in $(seq 1 "$ATTEMPTS"); do
+          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${host}/" || echo 000)"
+          echo "  attempt ${attempt}: HTTP ${code}"
+          if { [ "$MODE" = "on" ] && [ "$code" = "503" ]; } ||
+             { [ "$MODE" = "off" ] && [ "$code" != "503" ] && [ "$code" != "000" ]; }; then
+            echo "Confirmed: traffic is $([ "$MODE" = "on" ] && echo held || echo flowing)."
+            exit 0
+          fi
+          sleep 2
+        done
+
+        echo "::error::Never observed maintenance turning ${MODE} on ${host}."
+        echo "::error::Do not assume the window is $([ "$MODE" = "on" ] && echo open || echo closed)."
+        exit 1

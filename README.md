@@ -102,6 +102,21 @@ commit SHA and a named tag (default: `latest`). It outputs both `image-uri`
 (the named tag) and `sha-image-uri` (the immutable commit tag). AWS credentials
 must be configured in the calling job before this action runs.
 
+### `cloudflare-maintenance`
+
+Holds traffic at Cloudflare's edge by pointing a route at a maintenance Worker,
+or releases it by deleting that route — then confirms by requesting the site,
+and fails if it never observes the change. A window that cannot be confirmed to
+have started is worse than none, since the work it covers proceeds anyway.
+
+Held at the edge rather than the origin, so it works when the origin is gone,
+which is the situation a maintenance page is most wanted in. Unlike
+`ecs-maintenance` it also leaves load-balancer routing alone.
+
+The Worker and page live in lil-terraform's `lil-cloudflare-maintenance` module;
+this only attaches and detaches. Pass the script name and hostnames as inputs
+rather than reading Terraform state, so CI needs no access to the state bucket.
+
 ### `cloudflare-purge`
 
 Purges a Cloudflare zone's cache after a deploy, with a direct API call. Pass
