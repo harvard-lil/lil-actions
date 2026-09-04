@@ -36,17 +36,6 @@ inputs:
     description: 'Cloudflare account ID; required for the script existence check'
     required: false
     default: '1e8159697c2f0b09bd8fc9f9f4a80e80'
-  confirm:
-    description: >
-      Request the site afterwards until the change is visible, and fail if it
-      never is. Leave this on: a window that cannot be confirmed to have started
-      is worse than none, because the work it covers proceeds anyway.
-    required: false
-    default: 'true'
-  confirm-attempts:
-    description: 'How many times to check before giving up'
-    required: false
-    default: '15'
 
 runs:
   using: composite
@@ -60,8 +49,6 @@ runs:
         HOSTNAMES: ${{ inputs.hostnames }}
         CF_TOKEN: ${{ inputs.token }}
         ACCOUNT_ID: ${{ inputs.account-id }}
-        CONFIRM: ${{ inputs.confirm }}
-        ATTEMPTS: ${{ inputs.confirm-attempts }}
       run: |
         set -euo pipefail
         API=https://api.cloudflare.com/client/v4
@@ -189,26 +176,32 @@ runs:
           fi
         done
 
-        if [ "$CONFIRM" != "true" ]; then
-          echo "::warning::Not confirming; confirm was set to '${CONFIRM}'."
-          exit 0
-        fi
+        # Read the routes back rather than requesting the site. A request
+        # answers a different question and cannot always answer it: where a
+        # hostname sits behind Cloudflare Access the challenge arrives ahead of
+        # the Worker, so holding traffic never looks like 503 and releasing it
+        # always does, which reported success without having seen anything.
+        # What a caller needs to know is whether the route is in place, and the
+        # zone answers that directly.
+        after="$(cf GET "/zones/${ZONE_ID}/workers/routes")" || {
+          cf_fail "list Workers routes for zone ${ZONE_ID}" \
+            "Zone Workers Routes: Read on zone ${ZONE_ID}"
+          exit 1
+        }
 
-        # Route changes land within seconds and uniformly, so an observation
-        # here is meaningful rather than a sample of one edge location.
-        host="${HOSTS[0]}"
-        echo "Confirming against ${host}..."
-        for attempt in $(seq 1 "$ATTEMPTS"); do
-          code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${host}/" || echo 000)"
-          echo "  attempt ${attempt}: HTTP ${code}"
-          if { [ "$MODE" = "on" ] && [ "$code" = "503" ]; } ||
-             { [ "$MODE" = "off" ] && [ "$code" != "503" ] && [ "$code" != "000" ]; }; then
-            echo "Confirmed: traffic is $([ "$MODE" = "on" ] && echo held || echo flowing)."
-            exit 0
+        for host in "${HOSTS[@]}"; do
+          pattern="${host}/*"
+          present="$(jq -r --arg p "$pattern" \
+            '[.result[] | select(.pattern == $p)] | length' <<< "$after")"
+          if [ "$MODE" = "on" ] && [ "$present" -eq 0 ]; then
+            echo "::error::${pattern} has no route after holding traffic."
+            echo "::error::Do not assume the window is open."
+            exit 1
           fi
-          sleep 2
+          if [ "$MODE" = "off" ] && [ "$present" -ne 0 ]; then
+            echo "::error::${pattern} still routes to a maintenance page."
+            echo "::error::The site is not serving the application."
+            exit 1
+          fi
         done
-
-        echo "::error::Never observed maintenance turning ${MODE} on ${host}."
-        echo "::error::Do not assume the window is $([ "$MODE" = "on" ] && echo open || echo closed)."
-        exit 1
+        echo "Confirmed: traffic is $([ "$MODE" = "on" ] && echo held || echo flowing)."
