@@ -41,17 +41,17 @@ runs:
       run: |
         set -euo pipefail
 
-        revision="$(git rev-parse "$REVISION")"
-        if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-          echo "::error::Git returned an invalid commit SHA for $REVISION: $revision"
+        resolved_revision="$(git rev-parse "$REVISION")"
+        if [[ ! "$resolved_revision" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::Git returned an invalid commit SHA for $REVISION: $resolved_revision"
           exit 1
         fi
 
         candidates=()
-        if merge_parent="$(git rev-parse "${revision}^2" 2>/dev/null)"; then
+        if merge_parent="$(git rev-parse "${resolved_revision}^2" 2>/dev/null)"; then
           candidates+=("$merge_parent")
         fi
-        candidates+=("$revision")
+        candidates+=("$resolved_revision")
 
         digest=""
         source_sha=""
@@ -89,7 +89,7 @@ runs:
         done
 
         if [ -z "$digest" ]; then
-          echo "::error::No image exists for the merge's source commit or $revision in $REPOSITORY."
+          echo "::error::No image exists for the merge's source commit or $resolved_revision in $REPOSITORY."
           echo "::error::The source commit must complete its build-and-publish workflow first."
           exit 1
         fi
