@@ -275,9 +275,82 @@ source stability, rollback, and EventBridge update failures. These are contract
 tests, not evidence of a live AWS deployment.
 
 H2O keeps its migration/static/Lambda sequence and composes these helpers.
-Payments can reuse the same rollout/promotion/schedule checks while retaining
-its separate migration identity and reconciliation pause policy. Filecheck's
+The prepared Payments adoption uses the same rollout/promotion/schedule checks and ECS Exec migration
+model, with a daily reconciliation task whose schedule stays enabled. Filecheck's
 simpler image workflow uses the shared exact-revision wait. LIL-owned actions use
 `@main`; third-party actions remain pinned to reviewed full commit SHAs. Merge
 shared helper changes before consumer workflows that depend on their new inputs
 or behavior.
+
+### Shared Django maintenance policy
+
+`ecs-django-maintenance` implements H2O's existing migration-manifest decision:
+inspect the incoming image (or read an existing format-1 manifest) and compare it
+with the running application's migrations,
+then check its database for pending migrations. It returns `needed=true` for
+changed or unavailable manifests and failed checks. `force` wins over `skip`;
+skip suppresses the window, never migration execution. The caller owns
+Cloudflare maintenance and failure recovery.
+
+`ecs-django-migrations` uses ECS Exec in a running web task. Pass `task-definition`
+after verifying rollout to reject selection of a stale task. Commands report a
+framed remote exit status, and migration completion is followed by a fresh plan
+check. A successful SSM session alone is not accepted as Django success.
+Both actions require Python 3, AWS CLI, the Session Manager plugin, and ECS Exec
+permissions; task inspection also requires `ecs:DescribeTasks`.
+
+The prepared Payments adoption uses these helpers with an application database owner and a web task
+role limited to ECS Exec channels. The prepared H2O adoption uses `ecs-django-maintenance` with its
+published manifest and existing force/skip label outputs. The incoming web revision must boot against the old schema. These
+helpers do not classify migrations as safe for concurrent traffic or coordinate
+scheduled jobs. Merge the shared changes before consumers use the new action.
+
+`django-migration-manifest` runs the shared inspector in a built image and writes
+its JSON result on the runner. Inputs are `image`, optional `working-directory`
+and `settings-module`, and a JSON `environment` of placeholder settings values.
+The container has no network access and a read-only root. Django is initialized,
+but its migration loader uses no database connection. Application startup hooks
+must also work without database access for this inspection path.
+
+`ecs-django-maintenance` accepts either `image` with those same inspection inputs,
+or `manifest` for an existing artifact such as H2O's. Image-inspection errors
+stop the workflow before maintenance or rollout. An unavailable running-task
+check requires maintenance. Both image and running-task inspection execute the
+same `scripts/django_manifest.py`; applications need no management command or
+baked manifest. `manifest-command` is an optional compatibility override.
+The prepared H2O and Payments workflows inspect during CI and publish the result as a required OCI
+referrer. Deployment reads that artifact and never re-inspects the incoming image.
+
+### Container smoke tests
+
+`container-smoke-test` starts a built image with its default command, placeholder
+`environment` (JSON), no external network, a read-only root, dropped Linux
+capabilities, and writable `/tmp`. The caller supplies `probe-command` as JSON
+argv and optionally `timeout-seconds`. The probe executes inside the container;
+no host port is published. Container exit, probe failure until the deadline, or a
+hung probe fails the check. Logs are collected and the container is removed on
+both success and failure. This tests startup/health, not database or external API
+integration, image contents, or application-specific deployment identities.
+
+### ECR referrer artifacts
+
+`ecr-artifacts` publishes or fetches an array of single-file artifacts described
+by `type` and `path` (`media-type` is additionally required for publication).
+Configure AWS credentials before fetching, and log Docker in to ECR before
+publishing. Publication uses ORAS with a fixed timestamp and stable basename, keeping retries
+deterministic. Consumers use `ecr-publication-state` to require those artifact
+types before considering the image complete. Missing attachments are repaired
+from the existing immutable image, never by rebuilding its commit tag.
+
+Fetching uses the OCI registry API directly: one index, one manifest, and one
+blob request per artifact in the normal case, with one ECR login token for the
+batch. It verifies the subject, artifact type, SHA-256 digests, and payload size.
+Duplicate referrers pointing to identical payloads are accepted; conflicting
+payloads, missing artifacts, and authorization errors stop deployment. No Docker
+pull, container startup, or ORAS installation occurs on the fetch path. Tar
+creation/extraction stays in the caller that understands its static-file layout.
+
+The prepared H2O workflow uses these actions for both static assets and migrations, and delegates its
+maintenance decision to `ecs-django-maintenance` with the existing label outputs.
+The prepared Payments workflow uses the same flow for migrations; WhiteNoise assets stay in its image.
+Merge these shared changes before either consumer's workflow changes.

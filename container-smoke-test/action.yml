@@ -1,0 +1,26 @@
+name: Smoke-test a container
+description: Start an image offline with a read-only root, no capabilities and writable /tmp; wait for a health probe and always clean up.
+inputs:
+  image:
+    required: true
+    description: Built image to start using its default command
+  probe-command:
+    required: true
+    description: JSON argv array to execute inside the container; exit zero means healthy
+  environment:
+    default: '{}'
+    description: JSON placeholder environment for startup; do not supply production credentials
+  timeout-seconds:
+    default: '30'
+    description: Maximum wait for a successful probe
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        IMAGE: ${{ inputs.image }}
+        PROBE_COMMAND: ${{ inputs.probe-command }}
+        CONTAINER_ENVIRONMENT: ${{ inputs.environment }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: python3 "$ACTION_PATH/../scripts/container_smoke_test.py"
