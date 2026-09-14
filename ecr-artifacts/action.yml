@@ -1,0 +1,24 @@
+name: Publish or fetch ECR image artifacts
+description: Attach deterministic single-file OCI referrers or fetch and verify them without pulling the application image.
+inputs:
+  mode:
+    required: true
+    description: publish or fetch
+  image:
+    required: true
+    description: Full digest-pinned ECR image URI
+  artifacts:
+    required: true
+    description: JSON array of objects with type and path; publication also requires media-type
+runs:
+  using: composite
+  steps:
+    - if: inputs.mode == 'publish'
+      uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MODE: ${{ inputs.mode }}
+        IMAGE: ${{ inputs.image }}
+        ARTIFACTS: ${{ inputs.artifacts }}
+      run: python3 "$ACTION_PATH/../scripts/ecr_artifacts.py"
