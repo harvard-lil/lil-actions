@@ -5,6 +5,10 @@ description: >
   rebases, and fast-forwards without rebuilding the promoted artifact.
 
 inputs:
+  require-matching-tree:
+    description: 'Require the image source commit to have the promoted revision tree (rejects unbuilt merge changes).'
+    required: false
+    default: 'true'
   repository:
     description: 'ECR repository containing commit-SHA image tags'
     required: true
@@ -35,6 +39,7 @@ runs:
       id: resolve
       shell: bash
       env:
+        REQUIRE_MATCHING_TREE: ${{ inputs.require-matching-tree }}
         REPOSITORY: ${{ inputs.repository }}
         REVISION: ${{ inputs.revision }}
         REGISTRY: ${{ inputs.registry }}
@@ -47,6 +52,11 @@ runs:
           exit 1
         fi
 
+        if [[ "$REQUIRE_MATCHING_TREE" != true && "$REQUIRE_MATCHING_TREE" != false ]]; then
+          echo "::error::require-matching-tree must be true or false."
+          exit 1
+        fi
+        revision_tree="$(git rev-parse "${resolved_revision}^{tree}")"
         candidates=()
         if merge_parent="$(git rev-parse "${resolved_revision}^2" 2>/dev/null)"; then
           candidates+=("$merge_parent")
@@ -61,6 +71,10 @@ runs:
             continue
           fi
           previous="$candidate"
+          if [ "$REQUIRE_MATCHING_TREE" = true ] && [ "$(git rev-parse "${candidate}^{tree}")" != "$revision_tree" ]; then
+            echo "Skipping $candidate: its source tree differs from the promoted revision."
+            continue
+          fi
           echo "Looking for $REPOSITORY:$candidate"
 
           set +e

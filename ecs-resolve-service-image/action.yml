@@ -46,14 +46,20 @@ runs:
       run: |
         set -euo pipefail
 
-        task_definition="$(aws ecs describe-services \
-          --cluster "$CLUSTER" \
-          --services "$SERVICE" \
-          --query 'services[0].taskDefinition' \
-          --output text)"
-
-        if [ -z "$task_definition" ] || [ "$task_definition" = "None" ]; then
-          echo "::error::Could not read the task definition selected by $CLUSTER/$SERVICE."
+        read_stable_service() {
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json |
+            jq -er '
+              if (.failures | length) == 0 and (.services | length) == 1 then .services[0]
+              else error("expected exactly one ECS service") end |
+              if .desiredCount > 0 and .runningCount == .desiredCount and .pendingCount == 0 and
+                (.deployments | length) == 1 and .deployments[0].rolloutState == "COMPLETED" and
+                .deployments[0].taskDefinition == .taskDefinition then .taskDefinition
+              else error("source service must have a completed, stable deployment") end'
+        }
+        task_definition="$(read_stable_service)"
+        repository_uri="$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY"           --query 'repositories[0].repositoryUri' --output text)"
+        if [ -z "$repository_uri" ] || [ "$repository_uri" = None ]; then
+          echo "::error::Could not resolve the expected ECR repository."
           exit 1
         fi
 
@@ -63,7 +69,7 @@ runs:
           --output text)"
 
         case "$image_uri" in
-          */"${ECR_REPOSITORY}"@sha256:*) ;;
+          "${repository_uri}"@sha256:*) ;;
           *)
             echo "::error::$CLUSTER/$SERVICE is not running a digest-pinned image"
             echo "::error::from $ECR_REPOSITORY in container $CONTAINER_NAME: $image_uri"
@@ -77,17 +83,11 @@ runs:
           exit 1
         fi
 
-        source_sha="$(aws ecr describe-images \
-          --repository-name "$ECR_REPOSITORY" \
-          --image-ids "imageDigest=$digest" \
-          --query 'imageDetails[0].imageTags' \
-          --output text \
-          | tr '\t' '\n' \
-          | { grep -E '^[0-9a-f]{40}$' || true; } \
-          | head -n1)"
-
-        if [ -z "$source_sha" ]; then
-          echo "::error::No commit-SHA tag is attached to $digest in $ECR_REPOSITORY."
+        source_sha="$(aws ecr describe-images           --repository-name "$ECR_REPOSITORY" --image-ids "imageDigest=$digest"           --query 'imageDetails[0].imageTags' --output json |
+          jq -er '[.[] | select(test("^[0-9a-f]{40}$"))] | unique |
+            if length == 1 then .[0] else error("expected exactly one source commit tag") end')"
+        if [ "$(read_stable_service)" != "$task_definition" ]; then
+          echo "::error::Source service changed during image resolution. Retry after it settles."
           exit 1
         fi
 
