@@ -42,6 +42,18 @@ jobs:
       aws-role-arn: ${{ secrets.AWS_ROLE_ARN_STAGING }}
 ```
 
+### `ecs-deploy-image`
+
+Deploys an image already in ECR and identified by digest. It can move an
+explicitly mutable Terraform placeholder tag, add an immutable retention tag,
+register a task definition revision pinned to the digest, update the ECS
+service, and wait for a healthy rollout. Build and test remain outside this
+workflow, so deployments cannot rebuild the artifact they were asked to ship.
+
+The caller's role needs permission to read and tag the ECR repository,
+describe and register the task definition, pass its execution and task roles,
+and update and describe the service.
+
 ### `secret-scan`
 
 Runs [TruffleHog](https://github.com/trufflesecurity/trufflehog) over the change that triggered the calling workflow — the PR's `base..head` on `pull_request`, or the pushed `before..after` range on `push`. It catches secrets *introduced* by a change (even if a later commit in the same range removes them) and does **not** retroactively scan existing history, so it is safe to adopt on a repo that already has content. The job fails if any secret is found, blocking the merge or flagging the push.
@@ -133,7 +145,40 @@ unchanged. Use it at deploy time to mark which build candidates were actually
 promoted, so a lifecycle policy can keep deployed images longer than the
 candidate churn around them. Safe on repositories with immutable tags — adding a
 new tag is permitted, only repointing an existing one is not — and idempotent
-when a deploy is re-run.
+when a deploy is re-run. `replace-existing: true` permits a named mutable tag
+such as `latest` to move; immutable commit and retention tags should retain the
+default.
+
+### `ecr-publication-state`
+
+Classifies a commit-tagged ECR image as `absent`, `partial`, or `complete`.
+Callers may supply a JSON array of required OCI artifact types. A publication
+is complete only when the image exists and every required type has a readable
+referrer whose subject is that image digest. This lets a retry reuse a completed
+publication while distinguishing it from a run that pushed the image and then
+failed while attaching metadata.
+
+### `ecr-publish-image`
+
+Publishes an already-built local Docker image under one immutable ECR tag. It
+does not build, test, create a moving tag, or silently reuse an existing tag.
+Repository-owned CI can therefore hand it the exact local image that the same
+job tested.
+
+### `ecr-resolve-git-image`
+
+Resolves a tested image while promoting a branch: first the promoted merge
+commit's second parent, then the commit itself. This covers merge commits,
+squashes, rebases, and fast-forwards while refusing to rebuild a missing
+artifact.
+
+### `ecs-resolve-service-image`
+
+Reads the task definition an ECS service has selected, requires a named
+container to use a digest-pinned image from the expected ECR repository, and
+recovers the image's commit-SHA tag. Production promotion can therefore use the
+artifact staging actually selected rather than reconstructing provenance from
+Git history or the latest task-definition revision.
 
 ### `ecs-register-task-def`
 

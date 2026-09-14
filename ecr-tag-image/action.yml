@@ -18,6 +18,13 @@ inputs:
   tag:
     description: 'The tag to add'
     required: true
+  replace-existing:
+    description: >
+      Whether an existing tag may be moved to the source image. Leave false
+      for retention and commit tags. Set true only for an explicitly mutable
+      Terraform placeholder such as staging-latest or latest.
+    required: false
+    default: 'false'
 
 outputs:
   digest:
@@ -34,8 +41,14 @@ runs:
         REPOSITORY: ${{ inputs.repository }}
         SOURCE: ${{ inputs.source }}
         TAG: ${{ inputs.tag }}
+        REPLACE_EXISTING: ${{ inputs.replace-existing }}
       run: |
         set -euo pipefail
+
+        if [ "$REPLACE_EXISTING" != "true" ] && [ "$REPLACE_EXISTING" != "false" ]; then
+          echo "::error::replace-existing must be 'true' or 'false'."
+          exit 1
+        fi
 
         case "$SOURCE" in
           sha256:*) IMAGE_ID="imageDigest=$SOURCE" ;;
@@ -58,14 +71,27 @@ runs:
         # A re-run of a deploy reaches this with the tag already in place. That
         # is success, not a conflict -- but PutImage reports it as an error, so
         # check first rather than letting it fail the deploy.
-        EXISTING=$(aws ecr describe-images --repository-name "$REPOSITORY" \
+        set +e
+        EXISTING_OUTPUT=$(aws ecr describe-images --repository-name "$REPOSITORY" \
           --image-ids "imageTag=$TAG" --query 'imageDetails[0].imageDigest' \
-          --output text 2>/dev/null) || EXISTING=""
+          --output text 2>&1)
+        EXISTING_STATUS="$?"
+        set -e
+        if [ "$EXISTING_STATUS" -eq 0 ]; then
+          EXISTING="$EXISTING_OUTPUT"
+        elif grep -Fq 'ImageNotFoundException' <<< "$EXISTING_OUTPUT"; then
+          EXISTING=""
+        else
+          echo "::error::Could not inspect existing tag $REPOSITORY:$TAG."
+          echo "$EXISTING_OUTPUT" >&2
+          exit "$EXISTING_STATUS"
+        fi
         if [ "$EXISTING" = "$DIGEST" ]; then
           echo "$REPOSITORY:$TAG already points at $DIGEST"
           exit 0
         fi
-        if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ] && \
+           [ "$REPLACE_EXISTING" != "true" ]; then
           echo "::error::$REPOSITORY:$TAG already exists and points at $EXISTING,"
           echo "::error::not the $DIGEST being deployed. Refusing to guess."
           exit 1
@@ -75,4 +101,8 @@ runs:
           --image-ids "imageDigest=$DIGEST" --query 'images[0].imageManifest' --output text)
         aws ecr put-image --repository-name "$REPOSITORY" --image-tag "$TAG" \
           --image-manifest "$MANIFEST" >/dev/null
-        echo "Tagged $DIGEST as $REPOSITORY:$TAG"
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+          echo "Moved $REPOSITORY:$TAG from $EXISTING to $DIGEST"
+        else
+          echo "Tagged $DIGEST as $REPOSITORY:$TAG"
+        fi

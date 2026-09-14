@@ -47,6 +47,13 @@ runs:
 
         if [ -n "$IMAGE_URI" ]; then
           if [ -n "$CONTAINER_NAME" ]; then
+            if ! jq -e --arg name "$CONTAINER_NAME" \
+              'any(.containerDefinitions[]; .name == $name)' \
+              "$TASK_DEF_FILE" >/dev/null; then
+              echo "container $CONTAINER_NAME was not found in task definition $FAMILY" >&2
+              exit 1
+            fi
+
             jq --arg image "$IMAGE_URI" --arg name "$CONTAINER_NAME" \
               '(.containerDefinitions[] | select(.name == $name) | .image) = $image' \
               "$TASK_DEF_FILE" > "${TASK_DEF_FILE}.tmp"
