@@ -277,6 +277,7 @@ tests, not evidence of a live AWS deployment.
 H2O keeps its migration/static/Lambda sequence and composes these helpers.
 Payments can reuse the same rollout/promotion/schedule checks while retaining
 its separate migration identity and reconciliation pause policy. Filecheck's
-simpler image workflow uses the shared exact-revision wait. Consumers should pin
-composites to a reviewed full commit SHA; update related helpers together when
-adopting the stricter promotion checks above.
+simpler image workflow uses the shared exact-revision wait. LIL-owned actions use
+`@main`; third-party actions remain pinned to reviewed full commit SHAs. Merge
+shared helper changes before consumer workflows that depend on their new inputs
+or behavior.
