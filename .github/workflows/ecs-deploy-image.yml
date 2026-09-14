@@ -40,7 +40,7 @@ on:
       terraform-tag:
         description: >
           Optional explicitly mutable tag used by Terraform's placeholder task
-          definition. When set, it is moved to image-digest before deployment.
+          definition. When set, it is moved to image-digest after successful deployment.
         required: false
         type: string
         default: ''
@@ -103,15 +103,6 @@ jobs:
           source: ${{ inputs.image-digest }}
           tag: ${{ inputs.retention-tag }}
 
-      - name: Keep Terraform's image tag aligned
-        if: inputs.terraform-tag != ''
-        uses: harvard-lil/lil-actions/ecr-tag-image@main
-        with:
-          repository: ${{ inputs.ecr-repository }}
-          source: ${{ inputs.image-digest }}
-          tag: ${{ inputs.terraform-tag }}
-          replace-existing: 'true'
-
       - name: Register digest-pinned task definition
         id: task-definition
         uses: harvard-lil/lil-actions/ecs-register-task-def@main
@@ -133,22 +124,14 @@ jobs:
           cluster: ${{ inputs.cluster }}
           service: ${{ inputs.service }}
           timeout-seconds: ${{ inputs.timeout-seconds }}
+          task-definition: ${{ steps.task-definition.outputs.task-definition-arn }}
 
-      - name: Verify the requested revision completed
-        env:
-          CLUSTER: ${{ inputs.cluster }}
-          SERVICE: ${{ inputs.service }}
-          EXPECTED_TASK_DEFINITION: ${{ steps.task-definition.outputs.task-definition-arn }}
-        run: |
-          set -euo pipefail
-          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" |
-            jq -e --arg expected "$EXPECTED_TASK_DEFINITION" '
-              (.failures | length) == 0 and
-              (.services | length) == 1 and
-              (.services[0] |
-                .taskDefinition == $expected and
-                any(.deployments[];
-                  .status == "PRIMARY" and
-                  .taskDefinition == $expected and
-                  .rolloutState == "COMPLETED"))
-            ' >/dev/null
+
+      - name: Keep Terraform's image tag aligned
+        if: inputs.terraform-tag != ''
+        uses: harvard-lil/lil-actions/ecr-tag-image@main
+        with:
+          repository: ${{ inputs.ecr-repository }}
+          source: ${{ inputs.image-digest }}
+          tag: ${{ inputs.terraform-tag }}
+          replace-existing: 'true'

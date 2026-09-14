@@ -170,15 +170,22 @@ job tested.
 Resolves a tested image while promoting a branch: first the promoted merge
 commit's second parent, then the commit itself. This covers merge commits,
 squashes, rebases, and fast-forwards while refusing to rebuild a missing
-artifact.
+artifact. By default a candidate must have the same Git tree as the promoted
+revision, preventing an unbuilt merge resolution from selecting a parent image.
+`require-matching-tree: false` explicitly retains the older selection behavior.
+The checkout must include the revision and its parents.
 
 ### `ecs-resolve-service-image`
 
-Reads the task definition an ECS service has selected, requires a named
-container to use a digest-pinned image from the expected ECR repository, and
-recovers the image's commit-SHA tag. Production promotion can therefore use the
-artifact staging actually selected rather than reconstructing provenance from
-Git history or the latest task-definition revision.
+Requires one completed deployment with positive desired count, all desired tasks
+running and no pending tasks. Reads its selected task definition, checks the
+container image against the exact ECR repository URI, and requires exactly one
+commit-SHA tag on that digest. It rechecks source stability and revision before
+returning. Missing, ambiguous or changing provenance fails promotion.
+
+The role needs `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`,
+`ecr:DescribeRepositories`, and `ecr:DescribeImages`. This action does not wait
+for an in-progress source rollout; retry after staging is stable.
 
 ### `ecs-register-task-def`
 
@@ -190,7 +197,27 @@ updates.
 
 ### `ecs-update-eventbridge`
 
-Updates `EcsParameters.TaskDefinitionArn` on one or more EventBridge rules to point at a new task definition revision.
+Updates `EcsParameters.TaskDefinitionArn` on one or more EventBridge rules.
+Without `target-id`, each rule must have exactly one ECS target. With it, only
+that matching target is updated, leaving other targets alone. All writable target
+fields are preserved, including retry/dead-letter settings. Every rule is checked
+before writes begin; API partial failures and mismatched readback fail the action.
+Rule enabled/disabled state is unchanged. Multiple updates are not atomic: if a
+later write fails, earlier rules may already have changed. Retry or recover while
+keeping the application's maintenance/schedule policy in effect.
+
+### `ecs-wait-for-deployment`
+
+Pass `task-definition` with the full ARN returned by `ecs-register-task-def` or
+`ecs-deploy`. Success requires exactly that revision, one completed deployment,
+a positive desired count, all desired tasks running and no pending tasks. A
+completed rollback is a failure. If omitted, the expected revision is captured
+when waiting begins; a rollback completed before that capture cannot be detected.
+`timeout-seconds: '0'` performs one immediate check. Existing scaled-to-zero
+services no longer count as successful deployments.
+
+`ecs-deploy-image` supplies the expected ARN and moves the Terraform placeholder
+tag only after the requested deployment succeeds.
 
 ### `ecs-maintenance`
 
@@ -237,3 +264,19 @@ The same action can be reused for other commands:
     container: my-container
     command: invoke create-search-index
 ```
+
+## Deployment action tests
+
+`uv run --with pyyaml python -m unittest discover -s tests -v` runs the actual
+composite shell scripts against isolated simulated CLI responses. CI runs this
+suite alongside the existing compose-update tests, actionlint and shellcheck.
+Cases cover first publication/retries, partial referrers, promotion provenance,
+source stability, rollback, and EventBridge update failures. These are contract
+tests, not evidence of a live AWS deployment.
+
+H2O keeps its migration/static/Lambda sequence and composes these helpers.
+Payments can reuse the same rollout/promotion/schedule checks while retaining
+its separate migration identity and reconciliation pause policy. Filecheck's
+simpler image workflow uses the shared exact-revision wait. Consumers should pin
+composites to a reviewed full commit SHA; update related helpers together when
+adopting the stricter promotion checks above.

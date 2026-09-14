@@ -23,7 +23,7 @@ inputs:
 
 outputs:
   task-definition:
-    description: 'Task definition the service is now running'
+    description: 'Task definition selected by the update; use ecs-wait-for-deployment to verify rollout'
     value: ${{ steps.deploy.outputs.task-definition }}
 
 runs:
@@ -52,5 +52,5 @@ runs:
           --query 'service.taskDefinition' \
           --output text)"
 
-        echo "Service $SERVICE now on $deployed"
+        echo "Service $SERVICE selected $deployed; rollout has not been verified"
         echo "task-definition=$deployed" >> "$GITHUB_OUTPUT"
