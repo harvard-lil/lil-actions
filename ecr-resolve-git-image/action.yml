@@ -1,0 +1,109 @@
+name: 'Resolve an ECR image built from a promoted commit'
+description: >
+  Resolves the first ECR image tagged with either a merge commit's second
+  parent or the commit itself. This supports merge commits, squash merges,
+  rebases, and fast-forwards without rebuilding the promoted artifact.
+
+inputs:
+  repository:
+    description: 'ECR repository containing commit-SHA image tags'
+    required: true
+  revision:
+    description: 'Git revision being promoted'
+    required: false
+    default: HEAD
+  registry:
+    description: 'Optional ECR registry hostname used to construct image-uri'
+    required: false
+    default: ''
+
+outputs:
+  source-sha:
+    description: 'Commit SHA whose image was found'
+    value: ${{ steps.resolve.outputs.source-sha }}
+  image-digest:
+    description: 'Resolved image digest, including the sha256: prefix'
+    value: ${{ steps.resolve.outputs.image-digest }}
+  image-uri:
+    description: 'Digest-pinned image URI; empty when registry was omitted'
+    value: ${{ steps.resolve.outputs.image-uri }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve promoted commit image
+      id: resolve
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        REVISION: ${{ inputs.revision }}
+        REGISTRY: ${{ inputs.registry }}
+      run: |
+        set -euo pipefail
+
+        revision="$(git rev-parse "$REVISION")"
+        if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::Git returned an invalid commit SHA for $REVISION: $revision"
+          exit 1
+        fi
+
+        candidates=()
+        if merge_parent="$(git rev-parse "${revision}^2" 2>/dev/null)"; then
+          candidates+=("$merge_parent")
+        fi
+        candidates+=("$revision")
+
+        digest=""
+        source_sha=""
+        previous=""
+        for candidate in "${candidates[@]}"; do
+          if [ "$candidate" = "$previous" ]; then
+            continue
+          fi
+          previous="$candidate"
+          echo "Looking for $REPOSITORY:$candidate"
+
+          set +e
+          result="$(aws ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=$candidate" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>&1)"
+          status="$?"
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            if [[ ! "$result" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::ECR returned an invalid digest for $REPOSITORY:$candidate: $result"
+              exit 1
+            fi
+            digest="$result"
+            source_sha="$candidate"
+            break
+          fi
+          if ! grep -Fq 'ImageNotFoundException' <<< "$result"; then
+            echo "::error::Could not inspect $REPOSITORY:$candidate."
+            echo "$result" >&2
+            exit "$status"
+          fi
+        done
+
+        if [ -z "$digest" ]; then
+          echo "::error::No image exists for the merge's source commit or $revision in $REPOSITORY."
+          echo "::error::The source commit must complete its build-and-publish workflow first."
+          exit 1
+        fi
+
+        registry_host="${REGISTRY#https://}"
+        registry_host="${registry_host%/}"
+        image_uri=""
+        if [ -n "$registry_host" ]; then
+          image_uri="${registry_host}/${REPOSITORY}@${digest}"
+        fi
+
+        echo "Resolved $REPOSITORY:$source_sha to $digest."
+        {
+          echo "source-sha=$source_sha"
+          echo "image-digest=$digest"
+          echo "image-uri=$image_uri"
+        } >> "$GITHUB_OUTPUT"

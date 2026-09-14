@@ -1,0 +1,203 @@
+name: 'Inspect an ECR publication'
+description: >
+  Classifies an immutable image publication as absent, partial, or complete.
+  An existing image is complete only when every caller-declared OCI artifact
+  type has a readable referrer whose subject is that image digest. AWS
+  credentials must be configured before this action runs.
+
+inputs:
+  repository:
+    description: 'ECR repository name'
+    required: true
+  tag:
+    description: 'Immutable image tag to inspect, normally a commit SHA'
+    required: true
+  registry:
+    description: 'ECR registry hostname, normally the output of amazon-ecr-login'
+    required: true
+  required-artifact-types:
+    description: >
+      JSON array of OCI artifact types required for a complete publication.
+      Leave empty for an image whose successful push completes publication.
+    required: false
+    default: '[]'
+
+outputs:
+  state:
+    description: 'Publication state: absent, partial, or complete'
+    value: ${{ steps.inspect.outputs.state }}
+  digest:
+    description: 'Image digest when the tag exists; empty when absent'
+    value: ${{ steps.inspect.outputs.digest }}
+  image-uri:
+    description: 'Digest-pinned image URI when the tag exists; empty when absent'
+    value: ${{ steps.inspect.outputs.image-uri }}
+  missing-artifact-types:
+    description: 'JSON array of required artifact types not backed by a readable referrer'
+    value: ${{ steps.inspect.outputs.missing-artifact-types }}
+
+runs:
+  using: composite
+  steps:
+    - name: Inspect image and referrers
+      id: inspect
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        TAG: ${{ inputs.tag }}
+        REGISTRY: ${{ inputs.registry }}
+        REQUIRED_ARTIFACT_TYPES: ${{ inputs.required-artifact-types }}
+      run: |
+        set -euo pipefail
+
+        if ! required_types="$(jq -ce '
+          if type != "array" or any(.[]; type != "string" or length == 0)
+          then error("expected a JSON array of nonempty strings")
+          else unique
+          end
+        ' <<< "$REQUIRED_ARTIFACT_TYPES")"; then
+          echo "::error::required-artifact-types must be a JSON array of nonempty strings."
+          exit 1
+        fi
+
+        registry_host="${REGISTRY#https://}"
+        registry_host="${registry_host%/}"
+        if [ -z "$registry_host" ]; then
+          echo "::error::registry must name an ECR registry hostname."
+          exit 1
+        fi
+
+        # A missing tag is an expected state. Any other AWS error leaves the
+        # publication state unknown and must stop the caller.
+        set +e
+        describe_output="$(aws ecr describe-images \
+          --repository-name "$REPOSITORY" \
+          --image-ids "imageTag=$TAG" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text 2>&1)"
+        describe_status="$?"
+        set -e
+
+        if [ "$describe_status" -ne 0 ]; then
+          if grep -Fq 'ImageNotFoundException' <<< "$describe_output"; then
+            {
+              echo "state=absent"
+              echo "digest="
+              echo "image-uri="
+              echo "missing-artifact-types=$required_types"
+            } >> "$GITHUB_OUTPUT"
+            echo "$REPOSITORY:$TAG is absent."
+            exit 0
+          fi
+          echo "::error::Could not inspect $REPOSITORY:$TAG."
+          echo "$describe_output" >&2
+          exit "$describe_status"
+        fi
+
+        digest="$describe_output"
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::ECR returned an invalid digest for $REPOSITORY:$TAG: $digest"
+          exit 1
+        fi
+
+        image_uri="${registry_host}/${REPOSITORY}@${digest}"
+        if [ "$(jq 'length' <<< "$required_types")" -eq 0 ]; then
+          {
+            echo "state=complete"
+            echo "digest=$digest"
+            echo "image-uri=$image_uri"
+            echo "missing-artifact-types=[]"
+          } >> "$GITHUB_OUTPUT"
+          echo "$REPOSITORY:$TAG is complete at $digest; no referrers are required."
+          exit 0
+        fi
+
+        work_dir="$(mktemp -d)"
+        trap 'rm -rf "$work_dir"' EXIT
+        ecr_password="$(aws ecr get-login-password)"
+        missing='[]'
+        index=0
+
+        while IFS= read -r artifact_type; do
+          index="$((index + 1))"
+          encoded_type="$(jq -rn --arg value "$artifact_type" '$value | @uri')"
+          referrers_file="$work_dir/referrers-$index.json"
+          http_code="$(curl --silent --show-error --location \
+            --user "AWS:${ecr_password}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            --output "$referrers_file" \
+            --write-out '%{http_code}' \
+            "https://${registry_host}/v2/${REPOSITORY}/referrers/${digest}?artifactType=${encoded_type}")"
+
+          if [ "$http_code" = "404" ]; then
+            missing="$(jq -c --arg value "$artifact_type" '. + [$value]' <<< "$missing")"
+            continue
+          fi
+          if [ "$http_code" != "200" ]; then
+            echo "::error::ECR returned HTTP $http_code while reading referrers for $artifact_type."
+            exit 1
+          fi
+          if ! jq -e 'type == "object" and (.manifests | type == "array")' \
+            "$referrers_file" >/dev/null; then
+            echo "::error::ECR returned an invalid referrers index for $artifact_type."
+            exit 1
+          fi
+
+          found=false
+          mapfile -t candidates < <(jq -r --arg type "$artifact_type" '
+            .manifests[]? | select(.artifactType == $type) | .digest
+          ' "$referrers_file")
+
+          for candidate in "${candidates[@]}"; do
+            if [[ ! "$candidate" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::The referrers index returned an invalid digest: $candidate"
+              exit 1
+            fi
+
+            manifest_file="$work_dir/manifest-$index.json"
+            http_code="$(curl --silent --show-error --location \
+              --user "AWS:${ecr_password}" \
+              --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              --output "$manifest_file" \
+              --write-out '%{http_code}' \
+              "https://${registry_host}/v2/${REPOSITORY}/manifests/${candidate}")"
+
+            if [ "$http_code" = "404" ]; then
+              continue
+            fi
+            if [ "$http_code" != "200" ]; then
+              echo "::error::ECR returned HTTP $http_code while reading referrer $candidate."
+              exit 1
+            fi
+
+            if jq -e --arg subject "$digest" --arg type "$artifact_type" '
+              .subject.digest == $subject and
+              .artifactType == $type and
+              (.layers | type == "array") and
+              (.layers | length > 0)
+            ' "$manifest_file" >/dev/null; then
+              found=true
+              break
+            fi
+          done
+
+          if [ "$found" != "true" ]; then
+            missing="$(jq -c --arg value "$artifact_type" '. + [$value]' <<< "$missing")"
+          fi
+        done < <(jq -r '.[]' <<< "$required_types")
+
+        if [ "$(jq 'length' <<< "$missing")" -eq 0 ]; then
+          state=complete
+          echo "$REPOSITORY:$TAG is complete at $digest."
+        else
+          state=partial
+          echo "$REPOSITORY:$TAG is partial at $digest."
+          echo "Missing artifact types: $missing"
+        fi
+
+        {
+          echo "state=$state"
+          echo "digest=$digest"
+          echo "image-uri=$image_uri"
+          echo "missing-artifact-types=$missing"
+        } >> "$GITHUB_OUTPUT"

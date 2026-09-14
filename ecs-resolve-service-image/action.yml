@@ -1,0 +1,100 @@
+name: 'Resolve the image running in an ECS service'
+description: >
+  Reads the task definition selected by an ECS service, requires the named
+  container to use a digest-pinned image from the expected ECR repository, and
+  recovers the commit SHA tag attached to that digest.
+
+inputs:
+  cluster:
+    description: 'ECS cluster containing the source service'
+    required: true
+  service:
+    description: 'ECS service whose selected task definition is authoritative'
+    required: true
+  container-name:
+    description: 'Container whose image should be resolved'
+    required: true
+  ecr-repository:
+    description: 'ECR repository the source image must come from'
+    required: true
+
+outputs:
+  task-definition-arn:
+    description: 'Task definition selected by the source service'
+    value: ${{ steps.resolve.outputs.task-definition-arn }}
+  image-uri:
+    description: 'Digest-pinned image URI read from the task definition'
+    value: ${{ steps.resolve.outputs.image-uri }}
+  image-digest:
+    description: 'Resolved image digest, including the sha256: prefix'
+    value: ${{ steps.resolve.outputs.image-digest }}
+  source-sha:
+    description: 'Commit SHA tag attached to the resolved digest'
+    value: ${{ steps.resolve.outputs.source-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve service image
+      id: resolve
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+      run: |
+        set -euo pipefail
+
+        task_definition="$(aws ecs describe-services \
+          --cluster "$CLUSTER" \
+          --services "$SERVICE" \
+          --query 'services[0].taskDefinition' \
+          --output text)"
+
+        if [ -z "$task_definition" ] || [ "$task_definition" = "None" ]; then
+          echo "::error::Could not read the task definition selected by $CLUSTER/$SERVICE."
+          exit 1
+        fi
+
+        image_uri="$(aws ecs describe-task-definition \
+          --task-definition "$task_definition" \
+          --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
+          --output text)"
+
+        case "$image_uri" in
+          */"${ECR_REPOSITORY}"@sha256:*) ;;
+          *)
+            echo "::error::$CLUSTER/$SERVICE is not running a digest-pinned image"
+            echo "::error::from $ECR_REPOSITORY in container $CONTAINER_NAME: $image_uri"
+            exit 1
+            ;;
+        esac
+
+        digest="${image_uri#*@}"
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::ECS returned an invalid image digest: $digest"
+          exit 1
+        fi
+
+        source_sha="$(aws ecr describe-images \
+          --repository-name "$ECR_REPOSITORY" \
+          --image-ids "imageDigest=$digest" \
+          --query 'imageDetails[0].imageTags' \
+          --output text \
+          | tr '\t' '\n' \
+          | { grep -E '^[0-9a-f]{40}$' || true; } \
+          | head -n1)"
+
+        if [ -z "$source_sha" ]; then
+          echo "::error::No commit-SHA tag is attached to $digest in $ECR_REPOSITORY."
+          exit 1
+        fi
+
+        echo "Resolved $CLUSTER/$SERVICE to $image_uri, built from $source_sha."
+        {
+          echo "task-definition-arn=$task_definition"
+          echo "image-uri=$image_uri"
+          echo "image-digest=$digest"
+          echo "source-sha=$source_sha"
+        } >> "$GITHUB_OUTPUT"
