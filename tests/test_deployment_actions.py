@@ -16,7 +16,7 @@ DIGEST = 'sha256:' + 'b' * 64
 ARN = 'arn:aws:ecs:us-east-1:123456789012:task-definition/web:42'
 REPOSITORY = '123456789012.dkr.ecr.us-east-1.amazonaws.com/web'
 
-FAKE = '''import json, os, pathlib, sys
+FAKE = '''import json, os, pathlib, re, sys
 path = pathlib.Path(os.environ['CLI_RESPONSES'])
 state = json.loads(path.read_text())
 args = sys.argv[1:]
@@ -37,6 +37,9 @@ path.write_text(json.dumps(state))
 if tool == 'curl':
     pathlib.Path(args[args.index('--output') + 1]).write_text(json.dumps(response['body']))
 print(response.get('stdout', ''))
+if 'remote_status' in response:
+    marker = re.search(r'DJANGO_RESULT_[0-9a-f]+', args[args.index('--command') + 1]).group()
+    print(f"{marker}={response['remote_status']}")
 if response.get('stderr'):
     print(response['stderr'], file=sys.stderr)
 sys.exit(response.get('code', 0))
@@ -76,6 +79,9 @@ class Actions(unittest.TestCase):
                        GITHUB_OUTPUT=str(outputs), AWS_PAGER='')
             step = doc['runs']['steps'][0]
             for key, expression in step.get('env', {}).items():
+                if expression == '${{ github.action_path }}':
+                    env[key] = str(ROOT / action)
+                    continue
                 match = re.fullmatch(r'\$\{\{ inputs\.([\w-]+) \}\}', expression)
                 self.assertIsNotNone(match, expression)
                 env[key] = values[match[1]]
@@ -86,6 +92,20 @@ class Actions(unittest.TestCase):
             self.assertEqual(state['responses'], [], state)
             self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
             return dict(line.split('=', 1) for line in outputs.read_text().splitlines()), state['calls']
+
+    def test_exec_requires_remote_success(self):
+        for response, ok in [
+            (reply(contains=['execute-command'], remote_status=0), True),
+            (reply(contains=['execute-command'], remote_status=1), False),
+            (reply(contains=['execute-command'], output='Cannot perform start session: EOF'), False),
+            (reply(contains=['execute-command'], remote_status=0, code=2), False),
+        ]:
+            with self.subTest(response=response):
+                self.run_action('ecs-exec-command', [
+                    reply(output={'taskArns': ['task']}, contains=['list-tasks']),
+                    reply(output={'tasks': [{'lastStatus': 'RUNNING', 'taskDefinitionArn': ARN}]}, contains=['describe-tasks']),
+                    response,
+                ], {'cluster': 'web', 'service': 'web', 'container': 'web', 'command': 'invoke create-search-index'}, ok)
 
     def wait(self, current, ok):
         return self.run_action('ecs-wait-for-deployment', [described(current)],

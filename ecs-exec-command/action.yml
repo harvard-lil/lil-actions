@@ -2,6 +2,7 @@ name: 'Run ECS exec command'
 
 description: >
   Runs a command inside a running ECS service task using ECS Exec.
+  Verifies the remote command exit status before reporting success.
   AWS credentials must be configured before this action runs.
 
 inputs:
@@ -27,17 +28,9 @@ runs:
     - name: Run ECS exec command
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         CLUSTER: ${{ inputs.cluster }}
         SERVICE: ${{ inputs.service }}
         CONTAINER: ${{ inputs.container }}
         COMMAND: ${{ inputs.command }}
-      run: |
-        TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --desired-status RUNNING --query "taskArns[0]" --output text)"
-
-        if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
-          echo "No running ECS task found for service '$SERVICE' in cluster '$CLUSTER'"
-          exit 1
-        fi
-
-        aws ecs wait tasks-running --cluster "$CLUSTER" --tasks "$TASK_ARN"
-        aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" --container "$CONTAINER" --interactive --command "$COMMAND"
+      run: python3 "$ACTION_PATH/../scripts/ecs_django.py" exec

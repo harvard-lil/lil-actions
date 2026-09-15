@@ -239,6 +239,11 @@ Example:
 
 ### `ecs-exec-command`
 
+The action keeps Session Manager's input open in CI and requires a remote exit-status
+marker before reporting success. A lost session or failed command stops the action;
+commands are not retried automatically because they may have changed data.
+
+
 Runs a command inside a running ECS service task using ECS Exec. Use this for deployment-time commands such as Django migrations, index refreshes, or other one-off application commands that need to run inside the deployed container. AWS credentials must be configured before this action runs, and ECS Exec must be enabled for the service/task.
 
 Example:

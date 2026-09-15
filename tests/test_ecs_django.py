@@ -43,6 +43,44 @@ class DjangoActionsTests(unittest.TestCase):
         with patch.object(django, 'aws', side_effect=aws):
             self.assertEqual(django.execute('task', "printf '%s' \"it's quoted\"").strip(), "it's quoted")
 
+    def test_session_stdin_stays_open_until_remote_completion(self):
+        # Model the plugin's stdin reader: inherited /dev/null produces EOF
+        # before a delayed remote command can deliver its completion marker.
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'aws'
+            executable.write_text(f"#!{sys.executable}\n" + (
+                "import select, sys\n"
+                "if select.select([sys.stdin], [], [], 0.05)[0]:\n"
+                "    print('Cannot perform start session: EOF')\n"
+                "else:\n"
+                "    print('DJANGO_RESULT_token=0')\n"
+            ))
+            executable.chmod(0o755)
+            closed = subprocess.check_output([str(executable)], stdin=subprocess.DEVNULL, text=True)
+            self.assertIn('EOF', closed)
+            with patch.dict(os.environ, {'PATH': directory}), patch.object(django.uuid, 'uuid4') as uuid:
+                uuid.return_value.hex = 'token'
+                self.assertEqual(django.execute('task', 'true'), '')
+
+    def test_colored_plan_and_marker_are_parsed(self):
+        for plan, expected in [('Planned operations:', True), ('No planned migration operations.', False)]:
+            with self.subTest(plan=plan), patch.object(django.uuid, 'uuid4') as uuid:
+                uuid.return_value.hex = 'token'
+                output = f"\x1b[1m{plan}\x1b[0m\r\n\x1b[0mDJANGO_RESULT_token=0\r\n"
+                with patch.object(django, 'aws', return_value=output):
+                    self.assertEqual(django.pending('task'), expected)
+
+    def test_duplicate_completion_marker_is_rejected(self):
+        with patch.object(django.uuid, 'uuid4') as uuid, patch.object(django, 'aws', return_value='DJANGO_RESULT_token=0\nDJANGO_RESULT_token=0\n'):
+            uuid.return_value.hex = 'token'
+            with self.assertRaises(RuntimeError):
+                django.execute('task', 'true')
+
+    def test_migrate_uses_configured_directory_and_settings(self):
+        with patch.dict(os.environ, {'WORKING_DIRECTORY': '/app web', 'SETTINGS_MODULE': 'config.settings'}), patch.object(django, 'task', return_value='task'), patch.object(django, 'pending', side_effect=[True, False]), patch.object(django, 'execute', return_value='Applied') as execute:
+            django.migrate()
+            self.assertEqual(execute.call_args.args[1], "cd '/app web' && DJANGO_SETTINGS_MODULE=config.settings python manage.py migrate --noinput")
+
     def test_force_wins_over_skip(self):
         with patch.dict(os.environ, {'FORCE': 'true', 'SKIP': 'true'}), patch.object(django, 'task') as task:
             self.assertTrue(django.maintenance())

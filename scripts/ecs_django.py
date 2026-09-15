@@ -16,9 +16,22 @@ from image_migration_manifest import command, configure, inspect_image, parse
 
 
 def aws(*args):
-    return subprocess.check_output(
-        ['aws', *args], text=True, env={**os.environ, 'AWS_PAGER': ''},
-    )
+    args = ['aws', *args]
+    environment = {**os.environ, 'AWS_PAGER': ''}
+    if args[1:3] != ['ecs', 'execute-command']:
+        return subprocess.check_output(args, text=True, env=environment)
+    # Session Manager reads stdin even for a remote noninteractive command.
+    # CI's closed stdin ends that session with EOF, potentially losing output.
+    # Keep the pipe open until the remote session closes; communicate() would
+    # close it immediately. Never retry here: the command may have changed data.
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, env=environment) as process:
+        output = process.stdout.read()
+        status = process.wait()
+        if status:
+            print(output, end='')
+            raise subprocess.CalledProcessError(status, args, output=output)
+        return output
 
 
 def task():
@@ -43,11 +56,11 @@ def task():
 
 def execute(arn, command):
     marker = 'DJANGO_RESULT_' + uuid.uuid4().hex
-    wrapped = f"{command}\nstatus=$?\nprintf '\\n{marker}=%s\\n' \"$status\"\nexit \"$status\""
+    wrapped = f"export NO_COLOR=1\n{command}\nstatus=$?\nprintf '\\n{marker}=%s\\n' \"$status\"\nexit \"$status\""
     output = aws('ecs', 'execute-command', '--cluster', os.environ['CLUSTER'],
                  '--task', arn, '--container', os.environ['CONTAINER'],
                  '--interactive', '--command', '/bin/sh -c ' + shlex.quote(wrapped))
-    output = output.replace('\r', '')
+    output = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', output).replace('\r', '')
     statuses = re.findall(rf'^{marker}=(\d+)$', output, re.MULTILINE)
     if statuses != ['0']:
         print(output)
@@ -101,7 +114,7 @@ def migrate():
     if not pending(arn):
         print('No pending migrations.')
         return
-    print(execute(arn, os.environ.get('MIGRATE_COMMAND', 'python manage.py migrate --noinput')))
+    print(execute(arn, configure(os.environ.get('MIGRATE_COMMAND', 'python manage.py migrate --noinput'))))
     if pending(arn):
         raise RuntimeError('Migrations remain pending after migrate completed')
 
@@ -114,5 +127,7 @@ if __name__ == '__main__':
         print(f'Maintenance needed: {needed}')
     elif sys.argv[1] == 'migrate':
         migrate()
+    elif sys.argv[1] == 'exec':
+        print(execute(task(), os.environ['COMMAND']))
     else:
-        raise ValueError('Expected maintenance or migrate')
+        raise ValueError('Expected maintenance, migrate, or exec')
