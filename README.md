@@ -77,6 +77,29 @@ Defaults to `--results=verified,unknown` (flags confirmed-live *and* unverifiabl
 
 **When to use a reusable workflow vs. composite actions:** A reusable workflow is worth adding when a complete deployment pipeline — trigger to finish — is identical across multiple apps with only names changing. Avoid too much if-then, and instead compose complex workflows from building-block actions to make the sequence clear.
 
+## Promotion invariant
+
+Build, test, and publish on main. Promotion checks compose
+`ecr-resolve-git-image` (staging), `ecs-resolve-service-image` plus a source-tree
+comparison (production), and `ecr-publication-state` with required artifact types.
+Require a complete publication and matching digest. These checks read metadata
+and referrers; do not rebuild, pull or launch the application image, or rerun its
+test suite. Missing artifacts and unbuilt merge changes fail promotion and must
+be resolved on main.
+
+## Deployment credentials
+
+Reusable workflows require a secret contract between caller and callee.
+Repository-secret aliases and environment-secret lookup are different cases;
+selecting an environment in another job does not make its secrets available to
+the caller. Composite actions receive credentials through their documented
+inputs or step environment within the calling job.
+
+Follow the [LIL Engineering secret-scope and preflight guide](https://github.com/harvard-lil/lil-engineering/blob/main/docs/services/github-actions.md#secrets-across-workflow-boundaries).
+Validate credential availability and API permissions in the actual deployment
+job before maintenance or infrastructure changes. PR CI success does not test
+those deployment credentials.
+
 ## Actions
 
 Actions are building blocks for more complex deployments. Reference them with `uses: harvard-lil/lil-actions/<action-name>@main`.
