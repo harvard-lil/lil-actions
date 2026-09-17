@@ -21,7 +21,7 @@ inputs:
     default: '{}'
     description: >
       JSON object of secret name to value, e.g.
-      {"CLOUDFLARE_API_TOKEN":"${{ secrets.CLOUDFLARE_API_TOKEN }}"}. Each
+      {"CLOUDFLARE_API_TOKEN":"<token value>"}. Each
       value must be non-empty. A value containing a double quote or backslash
       would break the JSON; tokens and webhook URLs do not.
 runs:
