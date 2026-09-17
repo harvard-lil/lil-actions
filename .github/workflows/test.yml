@@ -52,6 +52,8 @@ jobs:
   composite-output-contract:
     name: Composite failure outputs
     runs-on: ubuntu-latest
+    env:
+      SEND_NOTIFICATIONS: 'false'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Load and run preflight without deployment credentials
@@ -83,7 +85,7 @@ jobs:
           [[ "$SUMMARY" == *"Migrations: applied (or none pending)"* ]]
       # GitHub still loads the manifest, but this must never send a message.
       - name: Validate notification manifest without sending Slack
-        if: ${{ false }}
+        if: env.SEND_NOTIFICATIONS == 'true'
         uses: ./deploy-notify
         with:
           webhook: unused
