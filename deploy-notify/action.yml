@@ -1,0 +1,48 @@
+name: Notify Slack of a deploy
+description: >
+  Posts one message to a Slack incoming webhook saying whether the deploy
+  succeeded, on which repository, branch and commit, what state it left
+  behind (deploy-outcome's summary), and where the run and the site are.
+  One step serves both outcomes, selected by status; run it with
+  `if: always()` and `status: ${{ job.status }}`. Sent with curl, so the
+  webhook stays in this step's environment.
+inputs:
+  webhook:
+    required: true
+    description: Slack incoming-webhook URL
+  status:
+    required: true
+    description: success, failure or cancelled, normally job.status
+  product:
+    required: true
+    description: Product name for the headline, e.g. H2O
+  tier-label:
+    required: true
+    description: Tier name for the headline, e.g. Staging
+  site-url:
+    required: true
+    description: The deployed site, linked at the end of the message
+  summary:
+    default: ''
+    description: deploy-outcome's summary output; posted as its own section when set
+  run-url:
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    description: Link to this run
+  commit:
+    default: ${{ github.sha }}
+    description: Commit to link, when the deployed commit is not github.sha
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        WEBHOOK: ${{ inputs.webhook }}
+        STATUS: ${{ inputs.status }}
+        PRODUCT: ${{ inputs.product }}
+        TIER_LABEL: ${{ inputs.tier-label }}
+        SITE_URL: ${{ inputs.site-url }}
+        SUMMARY: ${{ inputs.summary }}
+        RUN_URL: ${{ inputs.run-url }}
+        COMMIT: ${{ inputs.commit }}
+      run: python3 "$ACTION_PATH/../scripts/deploy_notify.py"

@@ -77,6 +77,19 @@ Defaults to `--results=verified,unknown` (flags confirmed-live *and* unverifiabl
 
 **When to use a reusable workflow vs. composite actions:** A reusable workflow is worth adding when a complete deployment pipeline — trigger to finish — is identical across multiple apps with only names changing. Avoid too much if-then, and instead compose complex workflows from building-block actions to make the sequence clear.
 
+## What the catalog records
+
+The actions below are the deployment practice LIL has settled on, written down
+once so each application composes it rather than re-deriving it. The practice
+errs toward efficiency: migrations run by ECS Exec in a web task that is
+already running, not in a dedicated task; a daily reconciliation job is not
+paused for a deploy; nothing is purged or rebuilt to make a check pass. The
+shape follows from that: small composites with explicit inputs, so a sequence
+reads as a list of what happens, with no if-then tangles and no reusable
+workflow spine that a consumer has to fit its own steps around. An
+application's sequence is these shared steps plus the steps only it needs,
+and those are the only ones it writes by hand.
+
 ## Promotion invariant
 
 Build, test, and publish on main. Promotion checks compose
@@ -160,6 +173,176 @@ Purges a Cloudflare zone's cache after a deploy, with a direct API call. Pass
 referenced by branch, and rebuilt from a floating base image on every run while
 holding a Cloudflare API token.
 
+### `deploy-flags`
+
+Resolves the three deploy intentions -- force a maintenance window, skip one,
+hold traffic after a successful deploy -- from every place a deployer can
+express them, and reports where each came from. The sources are the labels on
+the pull request behind the deployed commit (`deploy:force-maintenance-mode`,
+`deploy:skip-maintenance-mode`), the `workflow_dispatch` inputs
+(`force-maintenance`, `skip-maintenance`, `hold-maintenance`), and a standing
+variable such as `HOLD_MAINTENANCE`. Label and input names are configurable;
+the defaults are the ones H2O and Payments already use.
+
+```yaml
+- id: flags
+  uses: harvard-lil/lil-actions/deploy-flags@main
+  with:
+    event-name: ${{ github.event_name }}
+    inputs: ${{ toJSON(inputs) }}
+    hold-variable: ${{ vars.HOLD_MAINTENANCE }}
+  env:
+    GH_TOKEN: ${{ github.token }}
+```
+
+Outputs `force`, `skip` and `hold` are the strings `true` or `false`, and
+`sources` is one line such as `force from label deploy:force-maintenance-mode;
+hold from variable`, or `none`. Feed `force` and `skip` to
+`ecs-django-maintenance`; `hold` is for the caller's release step.
+
+Rules: labels are read off the commit with `gh api`, so a push carries them and
+a direct push or a deleted pull request finds none, which warns rather than
+fails. Dispatch inputs count only when `event-name` is `workflow_dispatch`; a
+reusable workflow sees the caller's event, so a tier workflow passes its inputs
+through as `workflow_call` inputs and the sequence hands them over with
+`toJSON(inputs)`. `hold` is true when the dispatch input or the variable says
+so, and implies `force`: a held site needs a window to be held in. When force
+and skip are both requested, force wins, `skip` comes out `false`, and
+`sources` says the skip was overridden. The label lookup needs
+`pull-requests: read` and a `GH_TOKEN` in the step's `env`.
+
+### `deploy-preflight`
+
+Fails before anything changes when the image digest or source SHA is the
+wrong shape, the tier is not in `allowed-tiers` (default `staging,prod`), or a
+required secret is empty in the selected environment. Every problem is
+reported at once, by name; no value is ever printed. Shape and presence only,
+which is what Payments and Perma already checked by hand: PR CI cannot prove a
+deployment credential works, and a permission probe here would only pretend to.
+
+```yaml
+- name: Check the deploy inputs
+  uses: harvard-lil/lil-actions/deploy-preflight@main
+  with:
+    image-digest: ${{ inputs.image-digest }}
+    source-sha: ${{ inputs.source-sha }}
+    tier: ${{ inputs.environment }}
+    required-secrets: >-
+      {"CLOUDFLARE_API_TOKEN":"${{ secrets.CLOUDFLARE_API_TOKEN }}",
+       "SLACK_WEBHOOK_URL":"${{ secrets.SLACK_WEBHOOK_URL }}"}
+```
+
+`required-secrets` is a JSON object of name to value written by the caller,
+since a composite cannot read the caller's `secrets` context. A value holding
+a double quote or backslash would break the JSON; tokens and webhook URLs do
+not. Why this shape: an empty token is found here, not at the maintenance step
+after the rollout has begun.
+
+### `deploy-outcome`
+
+Says what a run left behind, from four facts every sequence has: whether a
+maintenance window opened (`window`, from `ecs-django-maintenance`), whether
+the deployer asked for a hold (`hold`, from `deploy-flags`), and the outcomes
+of the migrate and release steps. When the window opened and either the
+migration did not end in `success` or `skipped` or the release did not
+succeed, it prints `::error` lines and fails the run: the site is behind the
+page and nobody asked for that. A hold with a clean migration is a `::notice`
+with the release procedure, and the run stays green. Otherwise it says nothing
+special. It does not call Cloudflare; the caller keeps its own release step.
+
+```yaml
+- name: Release traffic at the edge
+  id: release
+  if: always() && steps.window.outputs.needed == 'true' && steps.flags.outputs.hold != 'true' && (steps.migrate.outcome == 'success' || steps.migrate.outcome == 'skipped')
+  uses: harvard-lil/lil-actions/cloudflare-maintenance@main
+  with:
+    mode: 'off'
+    # zone-id, hostnames, token as for mode 'on'
+
+- name: Report what this run left behind
+  id: outcome
+  if: always()
+  uses: harvard-lil/lil-actions/deploy-outcome@main
+  with:
+    window: ${{ steps.window.outputs.needed }}
+    hold: ${{ steps.flags.outputs.hold }}
+    migrate-outcome: ${{ steps.migrate.outcome }}
+    release-outcome: ${{ steps.release.outcome }}
+    site-url: ${{ vars.SITE_URL }}
+    sources: ${{ steps.flags.outputs.sources }}
+```
+
+The release `if:` above is the one to copy: lifted whenever migrations either
+succeeded or never ran, since every failure before the migration leaves the
+previous tasks serving on an unchanged schema; kept up after a migration that
+failed partway, because the schema may suit neither version; kept up for a
+hold. `deploy-outcome` is its complement, so the two conditions are not
+derived twice.
+
+Outputs are `summary`, multi-line Slack mrkdwn (`*State:*`, one line per
+thing, `*Deploy flags:*` when `sources` is passed) without the payload
+envelope, and `left-behind`, `true` or `false`. A caller with more state to
+report -- Perma's capture intake and scheduler -- passes it as
+newline-separated `extra-lines`, and sets `extra-left-behind: 'true'` when one
+of those lines is something it left switched off, which fails the run the same
+way. Why this shape: the report is one step that always runs, rather than a
+hand-written condition on each consumer's release step and its inverse on a
+report step.
+
+### `deploy-notify`
+
+Posts one Slack message for a deploy: a headline by `status` (`success`,
+`failure` or `cancelled`), the repository, branch and commit, the
+`deploy-outcome` summary as its own section, and links to the run and the
+site. One step serves both outcomes:
+
+```yaml
+- name: Notify Slack
+  if: always()
+  uses: harvard-lil/lil-actions/deploy-notify@main
+  with:
+    webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+    status: ${{ job.status }}
+    product: H2O
+    tier-label: ${{ inputs.environment-label }}
+    site-url: ${{ vars.SITE_URL }}
+    summary: ${{ steps.outcome.outputs.summary }}
+```
+
+`run-url` defaults to this run and `commit` to `github.sha`; Perma passes its
+`source-sha` instead. The payload goes with `curl`, so no third-party action
+holds the webhook and no secret passes through a job output; a non-200 answer
+fails the step with Slack's response. Why this shape: h2o's two Slack steps carried
+different blocks and different wording for the same state, because each
+assembled its own JSON.
+
+### `static-assets-publish`
+
+Unpacks the static-file archive `ecr-artifacts` fetched and syncs it to the
+bucket every deployed version shares. Never `--delete`: a browser holding a
+page from the previous deploy can still fetch that page's files. Run it before
+the rollout, so no task serves a page whose files are not in the bucket yet.
+
+```yaml
+- name: Publish the image's static files
+  uses: harvard-lil/lil-actions/static-assets-publish@main
+  with:
+    bucket: lil-h2o-static
+    archive: static-assets.tar.gz
+    hashed-subdir: dist
+```
+
+`prefix` (default `static`) is both the top-level directory in the archive and
+the key prefix; `extract-to` (default `image-artifacts`) is where the archive
+is unpacked, the same directory `ecr-artifacts` writes manifests into. With
+`hashed-subdir` set, that subtree is synced with `max-age=31536000, immutable`
+and the rest with `max-age=3600` (h2o: Vite's `dist/` carries content hashes,
+Django admin's files do not); without it, one pass at `max-age=300` (Perma:
+nothing is hashed, and the edge cache is purged after the deploy). A missing
+archive, prefix directory or hashed subdirectory fails before any sync. Why
+this shape: the cache lifetimes are the policy, and they were copied by hand
+between sequences.
+
 ### `ecr-tag-image`
 
 Adds an extra tag to an image already in ECR, by re-registering its manifest
@@ -242,6 +425,49 @@ services no longer count as successful deployments.
 `ecs-deploy-image` supplies the expected ARN and moves the Terraform placeholder
 tag only after the requested deployment succeeds.
 
+The wait loop is `scripts/ecs_wait_for_deployment.sh`, shared with
+`ecs-scale-service`.
+
+### `ecs-scale-service`
+
+Stops a singleton service for the length of a deploy and starts it again on
+the revision the deploy chose. `mode: stop` records the service's desired
+count and task definition as outputs `desired-count` and `task-definition`,
+scales it to zero and waits, bounded by `timeout-seconds` (default 300), until
+no task is running. `mode: start` restores `desired-count` on `task-definition`
+with `--force-new-deployment` and waits for that exact revision with the same
+predicate `ecs-wait-for-deployment` uses, by running the same script; a
+`desired-count` of `0` restores the count and does not wait.
+
+```yaml
+- name: Stop the scheduler
+  id: stop-beat
+  if: steps.plan.outputs.pause == 'true'
+  uses: harvard-lil/lil-actions/ecs-scale-service@main
+  with:
+    mode: stop
+    cluster: ${{ env.ECS_CLUSTER }}
+    service: ${{ env.BEAT_SERVICE }}
+
+- name: Start the scheduler
+  if: always() && steps.stop-beat.outcome == 'success' && steps.roll.outcome == 'success'
+  uses: harvard-lil/lil-actions/ecs-scale-service@main
+  with:
+    mode: start
+    cluster: ${{ env.ECS_CLUSTER }}
+    service: ${{ env.BEAT_SERVICE }}
+    desired-count: ${{ steps.stop-beat.outputs.desired-count }}
+    task-definition: ${{ steps.beat.outputs.task-definition-arn }}
+```
+
+This is for services that must never run twice, such as one Celery beat, where
+stopping the old one before the new one starts is the only way to guarantee no
+overlap. It is not for cron-style scheduled tasks (EventBridge rules running
+an ECS task): those keep running through a deploy, and `ecs-update-eventbridge`
+repoints them without touching their schedule. Why this shape: the count and
+revision are recorded so the service is put back rather than guessed, and the
+start reuses the rollout predicate rather than a second definition of stable.
+
 ### `ecs-maintenance`
 
 Toggles an Application Load Balancer HTTPS listener between a live target group and a maintenance target group using weighted routing. Use `mode: on` before a deployment that needs a maintenance window, and `mode: off` after.
@@ -299,8 +525,12 @@ The same action can be reused for other commands:
 composite shell scripts against isolated simulated CLI responses. CI runs this
 suite alongside the existing compose-update tests, actionlint and shellcheck.
 Cases cover first publication/retries, partial referrers, promotion provenance,
-source stability, rollback, and EventBridge update failures. These are contract
-tests, not evidence of a live AWS deployment.
+source stability, rollback, EventBridge update failures, deploy-flag
+resolution from labels, dispatch inputs and the hold variable, and the deploy
+helpers: preflight shapes and empty secrets, outcome states and exit codes,
+the Slack payload against a scripted `curl`, static publication against a
+scripted `aws` with a real archive, and scaling a service to zero and back.
+These are contract tests, not evidence of a live AWS deployment.
 
 H2O keeps its migration/static/Lambda sequence and composes these helpers.
 The prepared Payments adoption uses the same rollout/promotion/schedule checks and ECS Exec migration
@@ -317,7 +547,8 @@ inspect the incoming image (or read an existing format-1 manifest) and compare i
 with the running application's migrations,
 then check its database for pending migrations. It returns `needed=true` for
 changed or unavailable manifests and failed checks. `force` wins over `skip`;
-skip suppresses the window, never migration execution. The caller owns
+skip suppresses the window, never migration execution. `deploy-flags` resolves
+both from labels, dispatch inputs and the hold variable. The caller owns
 Cloudflare maintenance and failure recovery.
 
 `ecs-django-migrations` uses ECS Exec in a running web task. Pass `task-definition`
