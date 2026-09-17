@@ -1,0 +1,224 @@
+name: 'Drain Celery queues before a deploy'
+
+description: >
+  Purges the named Celery queues and then waits for every worker to report no
+  active tasks, from inside a running ECS task over ECS Exec. Used ahead of a
+  rollout so that workers are replaced idle rather than mid-task, and so that
+  messages enqueued by the outgoing code are not consumed by the incoming
+  code.
+
+  Nothing here stops a worker or pauses whatever enqueues work; the caller
+  does that first, or the queues fill again as soon as they are purged.
+
+  The wait is reported, not enforced: `idle` says whether every worker went
+  quiet inside the timeout, and the caller decides what a `false` means.
+  AWS credentials must be configured before this action runs, and ECS Exec
+  must be enabled on the service.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+  service:
+    description: >
+      Service whose running task the commands run in. Any task of the
+      application image with broker access will do; a web task is the usual
+      choice, since a worker task may be about to stop.
+    required: true
+  container:
+    description: 'Container name within that task'
+    required: true
+  worker-services:
+    description: >
+      Whitespace- or comma-separated ECS services that run Celery workers,
+      one worker process per task. Their running task count is how many
+      workers must answer `celery inspect active` for the drain to count as
+      observed; a reply from fewer workers is not an idle fleet.
+    required: true
+  app:
+    description: 'Celery application, as passed to `celery -A`'
+    required: true
+  queues:
+    description: 'Whitespace- or comma-separated queue names to purge'
+    required: true
+  timeout-seconds:
+    description: 'How long to wait for every worker to go idle'
+    required: false
+    default: '120'
+  poll-interval-seconds:
+    description: 'Seconds between `celery inspect active` polls'
+    required: false
+    default: '5'
+
+outputs:
+  idle:
+    description: >
+      'true' when every expected worker reported no active tasks before the
+      timeout, 'false' when the timeout passed first.
+    value: ${{ steps.drain.outputs.idle }}
+  workers-expected:
+    description: 'Running tasks counted across worker-services'
+    value: ${{ steps.drain.outputs.workers-expected }}
+  workers-replied:
+    description: 'Workers that answered the last inspect'
+    value: ${{ steps.drain.outputs.workers-replied }}
+  active-tasks:
+    description: 'Active tasks reported by the last inspect'
+    value: ${{ steps.drain.outputs.active-tasks }}
+
+runs:
+  using: composite
+  steps:
+    - name: Purge the queues and wait for the workers to go idle
+      id: drain
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+        WORKER_SERVICES: ${{ inputs.worker-services }}
+        APP: ${{ inputs.app }}
+        QUEUES: ${{ inputs.queues }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+        POLL: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+
+        # These are spliced into a shell script below, so they are limited to
+        # characters that need no quoting there.
+        # shellcheck disable=SC2153  # set from inputs via env above
+        for value in "$APP" "$QUEUES" "$WORKER_SERVICES"; do
+          if ! printf '%s' "$value" | grep -Eq '^[A-Za-z0-9_.,-]+([[:space:]]+[A-Za-z0-9_.,-]+)*$'; then
+            echo "::error::'${value}' contains characters this action does not pass through."
+            exit 1
+          fi
+        done
+        for value in "$TIMEOUT" "$POLL"; do
+          if ! printf '%s' "$value" | grep -Eq '^[0-9]+$'; then
+            echo "::error::timeout-seconds and poll-interval-seconds must be whole numbers; got '${value}'."
+            exit 1
+          fi
+        done
+        queues="$(printf '%s' "$QUEUES" | tr ',' ' ')"
+        worker_services="$(printf '%s' "$WORKER_SERVICES" | tr ',' ' ')"
+
+        # One worker process per task, so the running task count across the
+        # worker services is how many replies an idle fleet produces.
+        expected=0
+        # shellcheck disable=SC2086
+        for svc in $worker_services; do
+          count="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$svc" \
+            --desired-status RUNNING --query 'length(taskArns)' --output text)"
+          echo "${svc}: ${count} running task(s)"
+          expected=$((expected + count))
+        done
+        echo "workers-expected=$expected" >> "$GITHUB_OUTPUT"
+
+        TASK_ARN="$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+          --desired-status RUNNING --query 'taskArns[0]' --output text)"
+        if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" = "None" ]; then
+          echo "::error::No running task in service '${SERVICE}' to run the drain from."
+          exit 1
+        fi
+
+        # The whole drain runs as one script inside the container, so the poll
+        # loop does not pay for an SSM session per iteration. The script is
+        # carried through the session as base64, which sidesteps every quoting
+        # layer between here and the remote shell; the values above are
+        # prepended as assignments and the body is a quoted heredoc so nothing
+        # in it expands on the runner. `sh -c` rather than a login shell:
+        # /etc/profile would reset PATH and lose a venv that `celery` and
+        # `python` are found through.
+        {
+          printf 'APP=%s\nQUEUES="%s"\nEXPECTED=%s\nTIMEOUT=%s\nPOLL=%s\n' \
+            "$APP" "$queues" "$expected" "$TIMEOUT" "$POLL"
+          cat <<'DRAIN'
+        set -u
+        for q in $QUEUES; do
+          echo "Purging queue ${q}"
+          if ! celery -A "$APP" purge -Q "$q" -f; then
+            echo "lil-drain purge-failed=${q}"
+            exit 0
+          fi
+        done
+        if [ "$EXPECTED" -eq 0 ]; then
+          echo "No worker tasks are running; nothing to wait for."
+          echo "lil-drain idle=true replied=0 active=0"
+          exit 0
+        fi
+        deadline=$(( $(date +%s) + TIMEOUT ))
+        replied=0
+        active=0
+        while :; do
+          if out="$(celery -A "$APP" inspect -j -t 10 active 2>/dev/null)"; then
+            summary="$(printf '%s' "$out" | python -c 'import json, sys
+        try:
+            replies = json.load(sys.stdin)
+        except ValueError:
+            print("parse-error 0 0")
+        else:
+            print("ok", len(replies), sum(len(v) for v in replies.values()))' 2>/dev/null)" \
+              || summary="parse-error 0 0"
+            # Three words: verdict, workers replied, tasks active.
+            set -- $summary
+            if [ "$1" = "ok" ]; then
+              replied="$2"
+              active="$3"
+              echo "$(date -u +%H:%M:%S) ${replied}/${EXPECTED} workers replied, ${active} active task(s)"
+              if [ "$replied" -ge "$EXPECTED" ] && [ "$active" -eq 0 ]; then
+                echo "lil-drain idle=true replied=${replied} active=0"
+                exit 0
+              fi
+            else
+              echo "$(date -u +%H:%M:%S) inspect returned something other than JSON"
+            fi
+          else
+            echo "$(date -u +%H:%M:%S) no worker replied"
+          fi
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "lil-drain idle=false replied=${replied} active=${active}"
+            exit 0
+          fi
+          sleep "$POLL"
+        done
+        DRAIN
+        } > drain.sh
+        encoded="$(base64 < drain.sh | tr -d '\n')"
+
+        echo "Draining from ${TASK_ARN##*/}: purge [${queues}], then wait up to ${TIMEOUT}s for ${expected} worker(s)."
+        if ! output="$(aws ecs execute-command --cluster "$CLUSTER" --task "$TASK_ARN" \
+              --container "$CONTAINER" --interactive \
+              --command "/bin/sh -c 'echo ${encoded} | base64 -d | sh'" 2>&1)"; then
+          printf '%s\n' "$output"
+          echo "::error::The ECS Exec session to ${TASK_ARN##*/} did not complete."
+          exit 1
+        fi
+        printf '%s\n' "$output"
+
+        # The session's exit status says nothing about the script, so the
+        # script's last line is the answer, and no such line means the script
+        # did not run to its end.
+        verdict="$(printf '%s' "$output" | tr -d '\r' | grep -o 'lil-drain [a-z=0-9_. -]*' | tail -n1 || true)"
+        if [ -z "$verdict" ]; then
+          echo "::error::The drain script did not report a result; the queues may or may not have been purged."
+          exit 1
+        fi
+        case "$verdict" in
+          *purge-failed=*)
+            echo "::error::Purging queue '${verdict##*purge-failed=}' failed; see the output above."
+            exit 1
+            ;;
+        esac
+        idle="$(printf '%s' "$verdict" | sed -n 's/.*idle=\([a-z]*\).*/\1/p')"
+        replied="$(printf '%s' "$verdict" | sed -n 's/.*replied=\([0-9]*\).*/\1/p')"
+        active="$(printf '%s' "$verdict" | sed -n 's/.*active=\([0-9]*\).*/\1/p')"
+        {
+          echo "idle=${idle}"
+          echo "workers-replied=${replied}"
+          echo "active-tasks=${active}"
+        } >> "$GITHUB_OUTPUT"
+        if [ "$idle" = "true" ]; then
+          echo "Queues purged and ${replied} worker(s) idle."
+        else
+          echo "::warning::Queues purged, but after ${TIMEOUT}s ${replied}/${expected} worker(s) had replied with ${active} task(s) still active."
+        fi

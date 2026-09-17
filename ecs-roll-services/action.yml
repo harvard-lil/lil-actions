@@ -1,0 +1,223 @@
+name: 'Roll ECS services to one image'
+
+description: >
+  Pins several services in one cluster to the same image, rolls them all, and
+  reports how each rollout ended. For a product whose web and worker roles
+  are separate services running one image: every service moves to the same
+  digest in one step, and a service that fails to stabilise is named rather
+  than hidden behind the first failure.
+
+  For each service, the latest ACTIVE revision of its task-definition family
+  is registered again with the image swapped on the container named after the
+  family, and the service is moved to that revision. The wait then watches
+  all of them together and ends when none is still rolling out. A service
+  whose deployment circuit breaker rolled it back is reported as such: it
+  ends on a COMPLETED deployment, but not the one this registered.
+
+  AWS credentials must be configured before this action runs.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+  services:
+    description: >
+      Whitespace- or comma-separated service names. Each service's task
+      definition must have a container named after its family, and that is
+      the container whose image is replaced.
+    required: true
+  image-uri:
+    description: 'Image every service is pinned to, ideally registry/repository@sha256:...'
+    required: true
+  environment-variables:
+    description: >
+      JSON object of environment variable names and values to set on the
+      pinned container of every service; existing variables of other names
+      are kept.
+    required: false
+    default: '{}'
+  timeout-seconds:
+    description: 'How long to wait for every rollout to end'
+    required: false
+    default: '900'
+  poll-interval-seconds:
+    description: 'Seconds between describe-services polls'
+    required: false
+    default: '30'
+
+outputs:
+  results:
+    description: >
+      JSON object keyed by service: {"state": "completed|rolled-back|failed|replaced|timed-out",
+      "task-definition": registered ARN, "running": running count on the primary deployment,
+      "desired": desired count, "reason": rolloutStateReason}.
+    value: ${{ steps.wait.outputs.results }}
+  summary:
+    description: 'One line per service, for a notification'
+    value: ${{ steps.wait.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - name: Register pinned revisions and move the services to them
+      id: update
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICES: ${{ inputs.services }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+        ENVIRONMENT_VARIABLES: ${{ inputs.environment-variables }}
+      run: |
+        set -euo pipefail
+
+        if ! jq -e 'type == "object" and all(.[]; type == "string" or type == "number" or type == "boolean")' \
+             <<< "$ENVIRONMENT_VARIABLES" >/dev/null; then
+          echo "::error::environment-variables must be a JSON object with scalar values."
+          exit 1
+        fi
+
+        # shellcheck disable=SC2153  # set from inputs via env above
+        services="$(printf '%s' "$SERVICES" | tr ',' ' ')"
+        if [ -z "${services// /}" ]; then
+          echo "::error::No services named."
+          exit 1
+        fi
+
+        # service<TAB>registered ARN, read back by the wait step.
+        : > roll-targets.tsv
+
+        # shellcheck disable=SC2086
+        for svc in $services; do
+          # shellcheck disable=SC2016  # the backticks are JMESPath, not shell
+          current="$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" \
+            --query 'services[?status==`ACTIVE`] | [0].taskDefinition' --output text)"
+          if [ -z "$current" ] || [ "$current" = "None" ]; then
+            echo "::error::No active service '${svc}' in cluster '${CLUSTER}'."
+            exit 1
+          fi
+          # arn:aws:ecs:region:account:task-definition/family:revision
+          family="${current##*/}"
+          family="${family%%:*}"
+
+          # The family's newest revision rather than the one the service runs:
+          # Terraform may have registered structural changes since the last
+          # deploy, and this is where they reach the service.
+          aws ecs describe-task-definition --task-definition "$family" --query taskDefinition --output json \
+            | jq 'del(.taskDefinitionArn, .revision, .status, .registeredAt, .registeredBy, .compatibilities, .requiresAttributes)' \
+            > "task-def-${family}.json"
+
+          if ! jq -e --arg name "$family" 'any(.containerDefinitions[]; .name == $name)' \
+               "task-def-${family}.json" >/dev/null; then
+            echo "::error::Task definition '${family}' has no container named '${family}'; nothing to pin."
+            exit 1
+          fi
+
+          jq --arg image "$IMAGE_URI" --arg name "$family" --argjson variables "$ENVIRONMENT_VARIABLES" '
+            (.containerDefinitions[] | select(.name == $name)) |= (
+              .image = $image
+              | .environment = (
+                  ((.environment // []) | map(.name as $key | select(($variables | has($key)) | not)))
+                  + ($variables | to_entries | map({name: .key, value: (.value | tostring)}))
+                )
+            )' "task-def-${family}.json" > "task-def-${family}.pinned.json"
+
+          registered="$(aws ecs register-task-definition --cli-input-json "file://task-def-${family}.pinned.json" \
+            --query taskDefinition.taskDefinitionArn --output text)"
+          echo "${svc}: registered ${registered##*/}"
+
+          aws ecs update-service --cluster "$CLUSTER" --service "$svc" \
+            --task-definition "$registered" --force-new-deployment \
+            --query 'service.serviceName' --output text >/dev/null
+          printf '%s\t%s\n' "$svc" "$registered" >> roll-targets.tsv
+        done
+
+    - name: Wait for every rollout to end
+      id: wait
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+        POLL: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+        deadline=$(( $(date +%s) + TIMEOUT ))
+        results='{}'
+
+        while :; do
+          pending=0
+          while IFS=$'\t' read -r svc registered; do
+            # A service whose state is already final is not asked again.
+            if jq -e --arg s "$svc" '.[$s].state != null and .[$s].state != "in-progress"' <<< "$results" >/dev/null; then
+              continue
+            fi
+            service="$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" \
+              --query 'services[0]' --output json)"
+            primary="$(jq '.deployments[] | select(.status == "PRIMARY")' <<< "$service")"
+            primary_def="$(jq -r '.taskDefinition' <<< "$primary")"
+            rollout="$(jq -r '.rolloutState // "UNKNOWN"' <<< "$primary")"
+            reason="$(jq -r '.rolloutStateReason // ""' <<< "$primary")"
+            running="$(jq -r '.runningCount' <<< "$primary")"
+            desired="$(jq -r '.desiredCount' <<< "$primary")"
+
+            state="in-progress"
+            if [ "$primary_def" != "$registered" ]; then
+              # The primary deployment is not the one this registered. The
+              # circuit breaker rolls a failed deployment back to the previous
+              # revision, which then shows as a healthy primary; anything else
+              # moved the service while this was waiting.
+              if jq -e --arg r "$registered" 'any(.deployments[]; .taskDefinition == $r and .rolloutState == "FAILED")' \
+                   <<< "$service" >/dev/null; then
+                state="rolled-back"
+              elif [ "$rollout" = "COMPLETED" ] || [ "$rollout" = "FAILED" ]; then
+                state="replaced"
+              fi
+            elif [ "$rollout" = "COMPLETED" ]; then
+              state="completed"
+            elif [ "$rollout" = "FAILED" ]; then
+              state="failed"
+            fi
+            if [ "$state" = "in-progress" ]; then
+              pending=$((pending + 1))
+            fi
+            echo "$(date -u +%H:%M:%S) ${svc}: ${rollout} ${running}/${desired} (${state})"
+
+            results="$(jq --arg s "$svc" --arg state "$state" --arg def "$registered" \
+              --arg running "$running" --arg desired "$desired" --arg reason "$reason" \
+              '.[$s] = {state: $state, "task-definition": $def, running: ($running | tonumber),
+                        desired: ($desired | tonumber), reason: $reason}' <<< "$results")"
+          done < roll-targets.tsv
+
+          if [ "$pending" -eq 0 ]; then
+            break
+          fi
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            results="$(jq '(.[] | select(.state == "in-progress") | .state) = "timed-out"' <<< "$results")"
+            break
+          fi
+          sleep "$POLL"
+        done
+
+        summary="$(jq -r 'to_entries[] | "\(.key): \(.value.state), \(.value.running)/\(.value.desired) running\(if .value.reason != "" then " -- " + .value.reason else "" end)"' <<< "$results")"
+        {
+          echo "results=$(jq -c . <<< "$results")"
+          echo "summary<<LIL_EOF"
+          echo "$summary"
+          echo "LIL_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### Rollout of ${CLUSTER}"
+          echo
+          echo "| Service | State | Running | Revision | Reason |"
+          echo "| --- | --- | --- | --- | --- |"
+          jq -r 'to_entries[] | "| \(.key) | \(.value.state) | \(.value.running)/\(.value.desired) | \(.value["task-definition"] | split("/")[-1]) | \(.value.reason) |"' <<< "$results"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo
+        echo "$summary"
+        not_ok="$(jq -r '[to_entries[] | select(.value.state != "completed") | .key] | join(" ")' <<< "$results")"
+        if [ -n "$not_ok" ]; then
+          echo "::error::Not every service reached the registered revision: ${not_ok}."
+          exit 1
+        fi
+        echo "Every service is running the registered revision."
