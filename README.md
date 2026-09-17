@@ -160,6 +160,44 @@ Purges a Cloudflare zone's cache after a deploy, with a direct API call. Pass
 referenced by branch, and rebuilt from a floating base image on every run while
 holding a Cloudflare API token.
 
+### `deploy-flags`
+
+Resolves the three deploy intentions -- force a maintenance window, skip one,
+hold traffic after a successful deploy -- from every place a deployer can
+express them, and reports where each came from. The sources are the labels on
+the pull request behind the deployed commit (`deploy:force-maintenance-mode`,
+`deploy:skip-maintenance-mode`), the `workflow_dispatch` inputs
+(`force-maintenance`, `skip-maintenance`, `hold-maintenance`), and a standing
+variable such as `HOLD_MAINTENANCE`. Label and input names are configurable;
+the defaults are the ones H2O and Payments already use.
+
+```yaml
+- id: flags
+  uses: harvard-lil/lil-actions/deploy-flags@main
+  with:
+    event-name: ${{ github.event_name }}
+    inputs: ${{ toJSON(inputs) }}
+    hold-variable: ${{ vars.HOLD_MAINTENANCE }}
+  env:
+    GH_TOKEN: ${{ github.token }}
+```
+
+Outputs `force`, `skip` and `hold` are the strings `true` or `false`, and
+`sources` is one line such as `force from label deploy:force-maintenance-mode;
+hold from variable`, or `none`. Feed `force` and `skip` to
+`ecs-django-maintenance`; `hold` is for the caller's release step.
+
+Rules: labels are read off the commit with `gh api`, so a push carries them and
+a direct push or a deleted pull request finds none, which warns rather than
+fails. Dispatch inputs count only when `event-name` is `workflow_dispatch`; a
+reusable workflow sees the caller's event, so a tier workflow passes its inputs
+through as `workflow_call` inputs and the sequence hands them over with
+`toJSON(inputs)`. `hold` is true when the dispatch input or the variable says
+so, and implies `force`: a held site needs a window to be held in. When force
+and skip are both requested, force wins, `skip` comes out `false`, and
+`sources` says the skip was overridden. The label lookup needs
+`pull-requests: read` and a `GH_TOKEN` in the step's `env`.
+
 ### `ecr-tag-image`
 
 Adds an extra tag to an image already in ECR, by re-registering its manifest
@@ -299,7 +337,8 @@ The same action can be reused for other commands:
 composite shell scripts against isolated simulated CLI responses. CI runs this
 suite alongside the existing compose-update tests, actionlint and shellcheck.
 Cases cover first publication/retries, partial referrers, promotion provenance,
-source stability, rollback, and EventBridge update failures. These are contract
+source stability, rollback, EventBridge update failures, and deploy-flag
+resolution from labels, dispatch inputs and the hold variable. These are contract
 tests, not evidence of a live AWS deployment.
 
 H2O keeps its migration/static/Lambda sequence and composes these helpers.
@@ -317,7 +356,8 @@ inspect the incoming image (or read an existing format-1 manifest) and compare i
 with the running application's migrations,
 then check its database for pending migrations. It returns `needed=true` for
 changed or unavailable manifests and failed checks. `force` wins over `skip`;
-skip suppresses the window, never migration execution. The caller owns
+skip suppresses the window, never migration execution. `deploy-flags` resolves
+both from labels, dispatch inputs and the hold variable. The caller owns
 Cloudflare maintenance and failure recovery.
 
 `ecs-django-migrations` uses ECS Exec in a running web task. Pass `task-definition`
