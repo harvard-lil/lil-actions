@@ -117,6 +117,75 @@ class Helpers(unittest.TestCase):
             return parse_outputs(outputs.read_text()), result.stdout + result.stderr, state['calls']
 
 
+class DeployOutcome(Helpers):
+    def outcome(self, window='true', hold='false', migrate='success', release='success', ok=True, **extra):
+        inputs = {'window': window, 'hold': hold, 'migrate-outcome': migrate, 'release-outcome': release,
+                  'site-url': 'https://example.org'} | extra
+        return self.run_action('deploy-outcome', inputs, ok=ok)
+
+    def test_lifted_window_is_quiet(self):
+        outputs, log, _ = self.outcome(sources='force from label deploy:force-maintenance-mode')
+        self.assertEqual(outputs['left-behind'], 'false')
+        self.assertEqual(outputs['summary'], '*State:*\nMaintenance page: shown for the deploy, now lifted\n'
+                         'Migrations: applied (or none pending)\n*Deploy flags:* force from label deploy:force-maintenance-mode')
+        self.assertNotIn('::error', log)
+        self.assertNotIn('::notice', log)
+
+    def test_no_window_is_quiet_whatever_happened(self):
+        for migrate, release in [('success', 'skipped'), ('failure', 'skipped'), ('skipped', 'skipped')]:
+            with self.subTest(migrate=migrate):
+                outputs, log, _ = self.outcome(window='false', migrate=migrate, release=release)
+                self.assertEqual(outputs['left-behind'], 'false')
+                self.assertIn('Maintenance page: never shown (no window needed)', outputs['summary'])
+                self.assertNotIn('::error', log)
+        outputs, _, _ = self.outcome(window='', migrate='', release='')
+        self.assertEqual(outputs['left-behind'], 'false')
+        self.assertIn('Migrations: never ran', outputs['summary'])
+
+    def test_failed_or_cancelled_migration_fails_the_run(self):
+        for migrate in ['failure', 'cancelled']:
+            with self.subTest(migrate=migrate):
+                outputs, log, _ = self.outcome(migrate=migrate, release='skipped', ok=False)
+                self.assertEqual(outputs['left-behind'], 'true')
+                self.assertIn(f'Maintenance page: STILL UP at https://example.org (migrations {migrate})', outputs['summary'])
+                self.assertIn('::error::Maintenance page: STILL UP', log)
+                self.assertIn('partially migrated', log)
+                self.assertIn('Re-running this workflow will not lift it', log)
+
+    def test_failed_migration_under_a_hold_is_still_a_failure(self):
+        outputs, log, _ = self.outcome(hold='true', migrate='failure', release='skipped', ok=False)
+        self.assertEqual(outputs['left-behind'], 'true')
+        self.assertNotIn('::notice', log)
+
+    def test_failed_release_fails_the_run(self):
+        for release in ['failure', 'skipped']:
+            with self.subTest(release=release):
+                outputs, log, _ = self.outcome(release=release, ok=False)
+                self.assertEqual(outputs['left-behind'], 'true')
+                self.assertIn(f'STILL UP at https://example.org (release {release})', log)
+                self.assertNotIn('partially migrated', log)
+
+    def test_deliberate_hold_is_a_notice_and_green(self):
+        outputs, log, _ = self.outcome(hold='true', release='skipped', sources='hold from variable')
+        self.assertEqual(outputs['left-behind'], 'false')
+        self.assertIn('Maintenance page: STILL UP at https://example.org, held deliberately', outputs['summary'])
+        self.assertIn('::notice::Deploy verified. MAINTENANCE MODE IS STILL ON', log)
+        self.assertIn('(hold from variable)', log)
+        self.assertIn('force-maintenance and without hold-maintenance', log)
+        self.assertNotIn('::error', log)
+
+    def test_extra_lines_and_caller_left_behind(self):
+        extra = 'Capture intake: paused for the deploy, now resumed\n\nScheduler: STILL STOPPED (was at 1)\n'
+        outputs, log, _ = self.outcome(**{'extra-lines': extra})
+        self.assertEqual(outputs['left-behind'], 'false')
+        self.assertIn('now lifted\nMigrations: applied (or none pending)\nCapture intake: paused for the deploy, now resumed\n'
+                      'Scheduler: STILL STOPPED (was at 1)', outputs['summary'])
+        self.assertNotIn('*Deploy flags:*', outputs['summary'])
+        outputs, log, _ = self.outcome(**{'extra-lines': extra, 'extra-left-behind': 'true'}, ok=False)
+        self.assertEqual(outputs['left-behind'], 'true')
+        self.assertIn('::error::Scheduler: STILL STOPPED (was at 1)', log)
+
+
 class StaticAssetsPublish(Helpers):
     def archive(self, path, files, name='static-assets.tar.gz'):
         with tarfile.open(path / name, 'w:gz') as tar:
@@ -173,6 +242,55 @@ class StaticAssetsPublish(Helpers):
         self.run_action('static-assets-publish', {'bucket': 'b', 'archive': 'static-assets.tar.gz'},
                         [reply(output='AccessDenied', code=1)],
                         prepare=lambda path: self.archive(path, ['static/x.css']), ok=False)
+
+
+class DeployNotify(Helpers):
+    def notify(self, status='success', summary='*State:*\nMaintenance page: never shown (no window needed)', ok=True, responses=None, **extra):
+        inputs = {'webhook': 'https://hooks.slack.com/services/T/B/x', 'status': status, 'product': 'H2O',
+                  'tier-label': 'Staging', 'site-url': 'https://opencasebook.org', 'summary': summary,
+                  'run-url': 'https://github.com/harvard-lil/h2o/actions/runs/123', 'commit': SHA} | extra
+        responses = [reply('curl', '200', contains=['--request', 'POST', '--data'])] if responses is None else responses
+        return self.run_action('deploy-notify', inputs, responses, ok=ok)
+
+    def texts(self, call):
+        return [block['text']['text'] for block in call['data']['blocks']]
+
+    def test_success_message(self):
+        _, log, calls = self.notify()
+        call = calls[0]
+        self.assertEqual(call['args'][-1], 'https://hooks.slack.com/services/T/B/x')
+        self.assertEqual(call['data']['text'], 'Staging H2O deployed successfully!')
+        texts = self.texts(call)
+        self.assertEqual(texts[0], '*Staging H2O deployed successfully!*')
+        self.assertEqual(texts[1], '*Repo:*\n<https://github.com/harvard-lil/h2o|`harvard-lil/h2o`>\n'
+                         '*Branch:*\n<https://github.com/harvard-lil/h2o/tree/staging|`staging`>\n'
+                         f'*Commit:*\n<https://github.com/harvard-lil/h2o/commit/{SHA}|`{SHA}`>')
+        self.assertEqual(texts[2], '*State:*\nMaintenance page: never shown (no window needed)')
+        self.assertEqual(texts[3], '*Run:* <https://github.com/harvard-lil/h2o/actions/runs/123|123>\n'
+                         '*View the site:* <https://opencasebook.org|https://opencasebook.org>')
+        self.assertNotIn('hooks.slack.com', log)
+
+    def test_failure_and_cancelled_headlines(self):
+        for status, headline in [('failure', 'Staging H2O deploy FAILED'), ('cancelled', 'Staging H2O deploy CANCELLED')]:
+            with self.subTest(status=status):
+                _, _, calls = self.notify(status)
+                self.assertEqual(self.texts(calls[0])[0], f'*{headline}*')
+
+    def test_empty_summary_has_no_section(self):
+        _, _, calls = self.notify(summary='')
+        self.assertEqual(len(self.texts(calls[0])), 3)
+
+    def test_unknown_status_and_empty_webhook_send_nothing(self):
+        _, log, calls = self.notify('green', responses=[], ok=False)
+        self.assertEqual(calls, [])
+        self.assertIn('status must be one of', log)
+        _, _, calls = self.notify(webhook=' ', responses=[], ok=False)
+        self.assertEqual(calls, [])
+
+    def test_slack_rejection_fails(self):
+        _, log, _ = self.notify(responses=[reply('curl', '403', body='invalid_token')], ok=False)
+        self.assertIn('::error::Slack answered HTTP 403: invalid_token', log)
+        self.notify(responses=[reply('curl', '', code=6)], ok=False)
 
 
 class EcsScaleService(Helpers):
