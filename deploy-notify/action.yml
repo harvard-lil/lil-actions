@@ -4,7 +4,7 @@ description: >
   succeeded, on which repository, branch and commit, what state it left
   behind (deploy-outcome's summary), and where the run and the site are.
   One step serves both outcomes, selected by status; run it with
-  `if: always()` and `status: ${{ job.status }}`. Sent with curl, so the
+  `if: always()` and the caller's job.status as the status input. Sent with curl, so the
   webhook stays in this step's environment.
 inputs:
   webhook:

@@ -48,3 +48,46 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml
       - run: python -m unittest discover -s tests -v
+
+  composite-output-contract:
+    name: Composite failure outputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Load and run preflight without deployment credentials
+        uses: ./deploy-preflight
+        with:
+          image-digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          source-sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          tier: staging
+      # This reports synthetic state only; it never changes infrastructure.
+      - name: Report a simulated failed release
+        id: failed-report
+        continue-on-error: true
+        uses: ./deploy-outcome
+        with:
+          window: 'true'
+          migrate-outcome: success
+          release-outcome: failure
+          site-url: https://example.invalid
+      - name: Verify outputs survive the composite action failure
+        if: always()
+        env:
+          OUTCOME: ${{ steps.failed-report.outcome }}
+          LEFT_BEHIND: ${{ steps.failed-report.outputs.left-behind }}
+          SUMMARY: ${{ steps.failed-report.outputs.summary }}
+        run: |
+          test "$OUTCOME" = failure
+          test "$LEFT_BEHIND" = true
+          [[ "$SUMMARY" == *"Maintenance page: STILL UP at https://example.invalid (release failure)"* ]]
+          [[ "$SUMMARY" == *"Migrations: applied (or none pending)"* ]]
+      # GitHub still loads the manifest, but this must never send a message.
+      - name: Validate notification manifest without sending Slack
+        if: ${{ false }}
+        uses: ./deploy-notify
+        with:
+          webhook: unused
+          status: failure
+          product: Test
+          tier-label: Test
+          site-url: https://example.invalid
