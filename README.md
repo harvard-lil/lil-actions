@@ -486,6 +486,41 @@ Example:
     service: my-ecs-service
 ```
 
+### `ecs-roll-services`
+
+Moves several services in one cluster to task definition revisions the caller
+has already registered (one `ecs-register-task-def` per family), then waits for
+all of them together and reports how each rollout ended. For a product whose
+web and worker roles are separate services running one image: every service
+moves in one step, and a service that fails to stabilise is named alongside
+the ones that succeeded rather than hidden behind the first failure.
+
+Success per service is `ecs-wait-for-deployment`'s definition: exactly the
+requested revision, one completed deployment, all desired tasks running and
+none pending. The `jq` predicates are the ones in
+`scripts/ecs_wait_for_deployment.sh`, inlined rather than run: that script
+waits on one service and exits, while this loop polls every service on each
+pass and classifies how each one ended. A service whose desired count is 0 when the roll begins has its
+revision recorded by `update-service` but is not waited for, and is reported
+as `skipped`, so a scaled-down worker or a scheduler the caller stopped does
+not fail the roll and does not count as verified either. Other states are
+`rolled-back` (the circuit breaker returned the service to its previous
+revision), `failed`, `replaced` (something else moved the service) and
+`timed-out`. `results` is JSON keyed by service; `summary` is one line for a
+notification; `skipped` lists the services not waited for. The step fails
+unless every service is `completed` or `skipped`.
+
+```yaml
+- name: Roll the web and worker services
+  id: roll
+  uses: harvard-lil/lil-actions/ecs-roll-services@main
+  with:
+    cluster: prod-perma
+    services: >-
+      {"prod-perma-web": "${{ steps.web.outputs.task-definition-arn }}",
+       "prod-perma-capture": "${{ steps.capture.outputs.task-definition-arn }}"}
+```
+
 ### `ecs-exec-command`
 
 The action keeps Session Manager's input open in CI and requires a remote exit-status
@@ -526,11 +561,13 @@ composite shell scripts against isolated simulated CLI responses. CI runs this
 suite alongside the existing compose-update tests, actionlint and shellcheck.
 Cases cover first publication/retries, partial referrers, promotion provenance,
 source stability, rollback, EventBridge update failures, deploy-flag
-resolution from labels, dispatch inputs and the hold variable, and the deploy
-helpers: preflight shapes and empty secrets, outcome states and exit codes,
+resolution from labels, dispatch inputs and the hold variable, the deploy
+helpers (preflight shapes and empty secrets, outcome states and exit codes,
 the Slack payload against a scripted `curl`, static publication against a
-scripted `aws` with a real archive, and scaling a service to zero and back.
-These are contract tests, not evidence of a live AWS deployment.
+scripted `aws` with a real archive, and scaling a service to zero and back),
+multi-service rolls (skipped, rolled-back and timed-out services), Celery
+manifest comparison and the idle wait. These are contract tests, not evidence
+of a live AWS deployment.
 
 H2O keeps its migration/static/Lambda sequence and composes these helpers.
 The prepared Payments adoption uses the same rollout/promotion/schedule checks and ECS Exec migration
@@ -590,6 +627,44 @@ no host port is published. Container exit, probe failure until the deadline, or 
 hung probe fails the check. Logs are collected and the container is removed on
 both success and failure. This tests startup/health, not database or external API
 integration, image contents, or application-specific deployment identities.
+
+### Celery task manifests and idle workers
+
+`celery-task-manifest` runs the application's own manifest command
+(default `python manage.py celery_task_manifest --output`, with the container
+path appended) in a built image with no network, a read-only root and
+placeholder `environment`, and writes the format-1 result on the runner. The
+document lists registered tasks with an argument-signature hash and queue, and
+the beat schedule; the application defines it, this action only carries it.
+CI publishes it as an OCI referrer next to the migration manifest.
+
+`celery-manifest-compare` takes two manifest paths and outputs `changed` and a
+one-line `summary` of added, removed and changed tasks and beat entries. A
+deployment reads the running image's referrer and the incoming one: unchanged
+means messages the outgoing code queued name tasks the incoming code registers
+with the same arguments on the same queues, so workers can be replaced with a
+warm shutdown and nothing paused. Changed, or a manifest that cannot be read,
+means the deployment should pause intake and drain before rolling.
+
+`celery-wait-idle` polls `celery -A <app> inspect active` through ECS Exec in
+a running service task (each poll is one session, framed like the Django
+helpers) until at least `min-workers` reply with no active tasks or
+`timeout-seconds` passes. It never purges a queue: a queued message is work
+for the incoming code, and whether that is acceptable is the manifest
+comparison's question. A timeout is reported through `idle=false` and a
+warning, not a failed step; a session that cannot run the command fails.
+
+```yaml
+- name: Wait for the workers to finish what they are doing
+  id: idle
+  uses: harvard-lil/lil-actions/celery-wait-idle@main
+  with:
+    cluster: prod-perma
+    service: prod-perma-web
+    container: prod-perma-web
+    app: perma
+    timeout-seconds: '120'
+```
 
 ### ECR referrer artifacts
 

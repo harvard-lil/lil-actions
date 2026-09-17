@@ -1,0 +1,201 @@
+name: 'Roll several ECS services to registered revisions'
+
+description: >
+  Moves each named service in one cluster to a task definition revision the
+  caller has already registered, then waits for all of them together and
+  reports how each rollout ended. For a product whose web and worker roles are
+  separate services running one image: every service moves in one step, and a
+  service that fails to stabilise is named rather than hidden behind the first
+  failure.
+
+  Success for a service means the same thing as in ecs-wait-for-deployment:
+  exactly the requested revision, one completed deployment, all desired tasks
+  running and none pending. A service whose desired count is 0 when the roll
+  begins is updated to its revision but not waited for, and reported as
+  skipped; nothing runs there to verify.
+
+  AWS credentials must be configured before this action runs.
+
+inputs:
+  cluster:
+    description: 'ECS cluster name'
+    required: true
+  services:
+    description: >
+      JSON object mapping each service name to the full task definition ARN it
+      should run, normally the outputs of ecs-register-task-def.
+    required: true
+  timeout-seconds:
+    description: 'How long to wait for every rollout to end'
+    required: false
+    default: '900'
+  poll-interval-seconds:
+    description: 'Seconds between describe-services polls'
+    required: false
+    default: '30'
+
+outputs:
+  results:
+    description: >
+      JSON object keyed by service: {"state": "completed|skipped|rolled-back|failed|replaced|timed-out",
+      "task-definition": requested ARN, "running": running count, "desired": desired count,
+      "reason": rolloutStateReason of the primary deployment}.
+    value: ${{ steps.roll.outputs.results }}
+  summary:
+    description: 'One entry per service on one line, separated by semicolons, for a notification'
+    value: ${{ steps.roll.outputs.summary }}
+  skipped:
+    description: 'Space-separated services skipped for having no desired tasks'
+    value: ${{ steps.roll.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    - name: Move the services and wait for every rollout to end
+      id: roll
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICES: ${{ inputs.services }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+        POLL: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+
+        # shellcheck disable=SC2153  # set from inputs via env above
+        if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and length > 0)' \
+             <<< "$SERVICES" >/dev/null; then
+          echo "::error::services must be a nonempty JSON object of service name to task definition ARN."
+          exit 1
+        fi
+        if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ ! "$POLL" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::Timeout must be nonnegative and poll interval must be positive."
+          exit 1
+        fi
+
+        describe() {
+          local response
+          response="$(aws ecs describe-services --cluster "$CLUSTER" --services "$1" --output json)"
+          if ! jq -e '(.failures | length) == 0 and (.services | length) == 1 and .services[0].status == "ACTIVE"' \
+               <<< "$response" >/dev/null; then
+            echo "::error::Could not read exactly one active ECS service named '$1' in '$CLUSTER'." >&2
+            return 1
+          fi
+          jq -c '.services[0]' <<< "$response"
+        }
+
+        # Every service is moved before any is waited for, so the rollouts
+        # overlap rather than run one after another. A service with no
+        # desired tasks still has its revision recorded: whoever scales it up
+        # later gets the image this deploy shipped, not the one before it.
+        results='{}'
+        while IFS=$'\t' read -r svc expected; do
+          current="$(describe "$svc")"
+          desired="$(jq -r '.desiredCount' <<< "$current")"
+          aws ecs update-service --cluster "$CLUSTER" --service "$svc" \
+            --task-definition "$expected" --force-new-deployment \
+            --query 'service.serviceName' --output text >/dev/null
+          if [ "$desired" -eq 0 ]; then
+            state=skipped
+            echo "${svc}: desired count is 0; revision ${expected##*/} recorded, rollout not awaited"
+          else
+            state=in-progress
+            echo "${svc}: moving to ${expected##*/}"
+          fi
+          results="$(jq --arg s "$svc" --arg state "$state" --arg def "$expected" --arg desired "$desired" \
+            '.[$s] = {state: $state, "task-definition": $def, running: 0, desired: ($desired | tonumber), reason: ""}' \
+            <<< "$results")"
+        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<< "$SERVICES")
+
+        start_time="$(date +%s)"
+        while :; do
+          pending=0
+          while IFS=$'\t' read -r svc expected; do
+            current="$(describe "$svc")"
+            running="$(jq -r '.runningCount' <<< "$current")"
+            desired="$(jq -r '.desiredCount' <<< "$current")"
+            primary="$(jq -c '[.deployments[] | select(.status == "PRIMARY")] | .[0] // {}' <<< "$current")"
+            rollout="$(jq -r '.rolloutState // "UNKNOWN"' <<< "$primary")"
+            reason="$(jq -r '.rolloutStateReason // ""' <<< "$primary")"
+
+            # Same success and failure predicates as
+            # scripts/ecs_wait_for_deployment.sh, split here so the state
+            # can be named per service; keep the two in step.
+            state=in-progress
+            if jq -e --arg expected "$expected" '
+              .taskDefinition == $expected and .desiredCount > 0 and
+              .runningCount == .desiredCount and .pendingCount == 0 and
+              (.deployments | length) == 1 and
+              .deployments[0].taskDefinition == $expected and
+              .deployments[0].rolloutState == "COMPLETED"
+            ' <<< "$current" >/dev/null; then
+              state=completed
+            elif jq -e --arg expected "$expected" '
+              any(.deployments[]; .taskDefinition == $expected and .rolloutState == "FAILED")
+            ' <<< "$current" >/dev/null; then
+              # The circuit breaker marks the requested deployment FAILED and
+              # returns the service to the previous revision, which then shows
+              # as a healthy primary. Either way the requested revision is not
+              # what runs.
+              if [ "$(jq -r '.taskDefinition' <<< "$current")" = "$expected" ]; then
+                state=failed
+              else
+                state=rolled-back
+              fi
+            elif jq -e '.desiredCount == 0' <<< "$current" >/dev/null; then
+              state=failed
+              reason="desired count became 0 while waiting"
+            elif jq -e --arg expected "$expected" '
+              .taskDefinition != $expected and
+              any(.deployments[]; .status == "PRIMARY" and .rolloutState == "COMPLETED")
+            ' <<< "$current" >/dev/null; then
+              # Something other than this run moved the service and that
+              # deployment finished; the requested revision was never reached.
+              state=replaced
+            fi
+            if [ "$state" = "in-progress" ]; then
+              pending=$((pending + 1))
+            fi
+            echo "$(date -u +%H:%M:%S) ${svc}: ${rollout} ${running}/${desired} (${state})"
+            results="$(jq --arg s "$svc" --arg state "$state" --arg running "$running" \
+              --arg desired "$desired" --arg reason "$reason" \
+              '.[$s] += {state: $state, running: ($running | tonumber), desired: ($desired | tonumber), reason: $reason}' \
+              <<< "$results")"
+          done < <(jq -r 'to_entries[] | select(.value.state == "in-progress") | "\(.key)\t\(.value["task-definition"])"' <<< "$results")
+
+          if [ "$pending" -eq 0 ]; then
+            break
+          fi
+          if [ "$(( $(date +%s) - start_time ))" -ge "$TIMEOUT" ]; then
+            results="$(jq '(.[] | select(.state == "in-progress") | .state) = "timed-out"' <<< "$results")"
+            break
+          fi
+          sleep "$POLL"
+        done
+
+        summary="$(jq -r '[to_entries[] | "\(.key): \(.value.state), \(.value.running)/\(.value.desired) running\(if .value.reason != "" then " -- " + .value.reason else "" end)"] | join("; ")' <<< "$results")"
+        skipped="$(jq -r '[to_entries[] | select(.value.state == "skipped") | .key] | join(" ")' <<< "$results")"
+        {
+          echo "results=$(jq -c . <<< "$results")"
+          echo "summary=${summary}"
+          echo "skipped=${skipped}"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          {
+            echo "### Rollout of ${CLUSTER}"
+            echo
+            echo "| Service | State | Running | Revision | Reason |"
+            echo "| --- | --- | --- | --- | --- |"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.state) | \(.value.running)/\(.value.desired) | \(.value["task-definition"] | split("/")[-1]) | \(.value.reason) |"' <<< "$results"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        echo
+        echo "$summary"
+        not_ok="$(jq -r '[to_entries[] | select(.value.state != "completed" and .value.state != "skipped") | .key] | join(" ")' <<< "$results")"
+        if [ -n "$not_ok" ]; then
+          echo "::error::Not every service reached its requested revision: ${not_ok}."
+          exit 1
+        fi
+        echo "Every service with desired tasks is running its requested revision."

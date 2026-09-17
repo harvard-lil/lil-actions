@@ -1,0 +1,53 @@
+name: Wait for Celery workers to go idle
+description: >
+  Polls `celery inspect active` through ECS Exec in a running service task
+  until every replying worker reports no active tasks, or a deadline passes.
+  Never purges a queue. AWS credentials must be configured before this action
+  runs, and ECS Exec must be enabled on the service.
+inputs:
+  cluster:
+    required: true
+    description: ECS cluster name
+  service:
+    required: true
+    description: Service whose running task issues the inspect; any task of the application image with broker access
+  container:
+    required: true
+    description: Container name within that task
+  app:
+    required: true
+    description: Celery application, as passed to `celery -A`
+  timeout-seconds:
+    default: '120'
+    description: How long to wait for the workers to go idle
+  poll-interval-seconds:
+    default: '10'
+    description: Seconds between inspect polls; each poll is one ECS Exec session
+  min-workers:
+    default: '1'
+    description: Workers that must reply before an empty active list counts as idle
+outputs:
+  idle:
+    description: true when at least min-workers replied with no active tasks before the deadline
+    value: ${{ steps.wait.outputs.idle }}
+  workers-replied:
+    description: Workers that answered the last inspect
+    value: ${{ steps.wait.outputs.workers-replied }}
+  active-tasks:
+    description: Active tasks reported by the last inspect
+    value: ${{ steps.wait.outputs.active-tasks }}
+runs:
+  using: composite
+  steps:
+    - id: wait
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+        APP: ${{ inputs.app }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+        MIN_WORKERS: ${{ inputs.min-workers }}
+      run: python3 "$ACTION_PATH/../scripts/celery_wait_idle.py"
