@@ -50,5 +50,7 @@ jobs:
       - name: Extract composite action scripts
         run: python scripts/extract_action_scripts.py "$RUNNER_TEMP/action-scripts"
 
+      # scripts/*.sh are bash that more than one action calls; they are plain
+      # files already, so they go straight to shellcheck.
       - name: Run shellcheck
-        run: shellcheck "$RUNNER_TEMP"/action-scripts/*.sh
+        run: shellcheck "$RUNNER_TEMP"/action-scripts/*.sh scripts/*.sh
