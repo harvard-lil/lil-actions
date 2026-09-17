@@ -1,0 +1,26 @@
+name: Compare Celery task manifests
+description: Report whether two format-1 Celery task manifests register the same tasks, arguments, queues and beat entries.
+inputs:
+  base:
+    required: true
+    description: Manifest of the code currently running
+  incoming:
+    required: true
+    description: Manifest of the image being deployed
+outputs:
+  changed:
+    description: true when any task or beat entry was added, removed or changed
+    value: ${{ steps.compare.outputs.changed }}
+  summary:
+    description: The differences on one line, separated by semicolons, or "no changes"
+    value: ${{ steps.compare.outputs.summary }}
+runs:
+  using: composite
+  steps:
+    - id: compare
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BASE: ${{ inputs.base }}
+        INCOMING: ${{ inputs.incoming }}
+      run: python3 "$ACTION_PATH/../scripts/celery_manifest.py" compare

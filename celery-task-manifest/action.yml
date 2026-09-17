@@ -1,0 +1,30 @@
+name: Inspect an image's Celery tasks
+description: Run the application's Celery task manifest command in a built image, offline, and write the format-1 result on the runner.
+inputs:
+  image:
+    required: true
+    description: Built local image or immutable registry image
+  output:
+    default: celery-tasks.json
+    description: Output manifest file
+  command:
+    default: python manage.py celery_task_manifest --output
+    description: Command that writes the manifest; the output path inside the container is appended
+  working-directory:
+    default: ''
+    description: Application directory; defaults to the image's working directory
+  environment:
+    default: '{}'
+    description: JSON object of placeholder environment values required to load settings; do not supply production credentials
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        IMAGE: ${{ inputs.image }}
+        MANIFEST: ${{ inputs.output }}
+        COMMAND: ${{ inputs.command }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        IMAGE_ENVIRONMENT: ${{ inputs.environment }}
+      run: python3 "$ACTION_PATH/../scripts/celery_manifest.py" inspect

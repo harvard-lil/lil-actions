@@ -240,6 +240,114 @@ class Actions(unittest.TestCase):
         self.run_action('ecr-publish-image', prefix + [reply(output=DIGEST)], inputs, False)
         self.run_action('ecr-publish-image', prefix + [reply(output='AccessDenied', code=1)], inputs, False)
 
+    def roll(self, services, responses, ok=True, **inputs):
+        return self.run_action('ecs-roll-services', responses,
+                               {'cluster': 'perma', 'services': json.dumps(services),
+                                'poll-interval-seconds': '1', 'timeout-seconds': '0'} | inputs, ok)
+
+    def test_roll_moves_every_service_then_waits(self):
+        worker = ARN.replace('web', 'worker')
+        active = service(status='ACTIVE')
+        responses = [described(active), reply(output='web', contains=['update-service', '--task-definition', ARN]),
+                     described(active), reply(output='worker', contains=['update-service', worker]),
+                     described(active), described(service(status='ACTIVE', taskDefinition=worker,
+                         deployments=[dict(taskDefinition=worker, rolloutState='COMPLETED', status='PRIMARY')]))]
+        outputs, calls = self.roll({'web': ARN, 'worker': worker}, responses)
+        results = json.loads(outputs['results'])
+        self.assertEqual({name: result['state'] for name, result in results.items()},
+                         {'web': 'completed', 'worker': 'completed'})
+        self.assertEqual(outputs['skipped'], '')
+        self.assertEqual([call['args'][1] for call in calls],
+                         ['describe-services', 'update-service'] * 2 + ['describe-services'] * 2)
+
+    def test_roll_skips_services_without_desired_tasks(self):
+        ia = ARN.replace('web', 'ia')
+        idle = service(status='ACTIVE', desiredCount=0, runningCount=0)
+        responses = [described(service(status='ACTIVE')), reply(contains=['update-service']),
+                     described(idle), reply(contains=['update-service', ia]),
+                     described(service(status='ACTIVE'))]
+        outputs, _ = self.roll({'web': ARN, 'ia': ia}, responses)
+        self.assertEqual(outputs['skipped'], 'ia')
+        self.assertEqual(json.loads(outputs['results'])['ia']['state'], 'skipped')
+
+    def test_roll_waits_across_polls(self):
+        responses = [described(service(status='ACTIVE')), reply(contains=['update-service']),
+                     described(service(status='ACTIVE', pendingCount=1)), described(service(status='ACTIVE'))]
+        outputs, _ = self.roll({'web': ARN}, responses, **{'timeout-seconds': '10'})
+        self.assertEqual(json.loads(outputs['results'])['web']['state'], 'completed')
+
+    def test_roll_reports_rollback_and_timeout(self):
+        previous = ARN.replace(':42', ':41')
+        rolled_back = service(status='ACTIVE', taskDefinition=previous, deployments=[
+            dict(taskDefinition=previous, rolloutState='COMPLETED', status='PRIMARY'),
+            dict(taskDefinition=ARN, rolloutState='FAILED', status='ACTIVE')])
+        for current, state in [(rolled_back, 'rolled-back'), (service(status='ACTIVE', pendingCount=1), 'timed-out')]:
+            with self.subTest(state=state):
+                outputs, _ = self.roll({'web': ARN}, [described(service(status='ACTIVE')),
+                                                      reply(contains=['update-service']), described(current)], False)
+                self.assertEqual(json.loads(outputs['results'])['web']['state'], state)
+
+    def test_roll_rejects_malformed_services(self):
+        for services in ['[]', '{}', '{"web": ""}']:
+            with self.subTest(services=services):
+                self.run_action('ecs-roll-services', [], {'cluster': 'perma', 'services': services}, False)
+
+    def manifest(self, directory, name, **changes):
+        document = {'format': 1,
+                    'tasks': {'perma.celery_tasks.run_next_capture': {'argspec': 'abc123', 'queue': 'celery'},
+                              'perma.celery_tasks.upload_to_ia': {'argspec': 'def456', 'queue': 'ia'}},
+                    'beat': {'run-next-capture': {'task': 'perma.celery_tasks.run_next_capture', 'schedule': '*/1'}}}
+        for section, entries in changes.items():
+            document[section] = entries
+        path = Path(directory) / name
+        path.write_text(json.dumps(document))
+        return str(path)
+
+    def test_celery_manifest_compare(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self.manifest(directory, 'base.json')
+            same = self.manifest(directory, 'same.json')
+            outputs, _ = self.run_action('celery-manifest-compare', [], {'base': base, 'incoming': same})
+            self.assertEqual(outputs['changed'], 'false')
+            changed = self.manifest(directory, 'changed.json',
+                tasks={'perma.celery_tasks.run_next_capture': {'argspec': 'abc124', 'queue': 'celery'},
+                       'perma.celery_tasks.new_task': {'argspec': '0', 'queue': 'background'}},
+                beat=[])
+            outputs, _ = self.run_action('celery-manifest-compare', [], {'base': base, 'incoming': changed})
+            self.assertEqual(outputs['changed'], 'true')
+            self.assertEqual(outputs['summary'].split('; '), [
+                'added task perma.celery_tasks.new_task', 'removed task perma.celery_tasks.upload_to_ia',
+                'changed task perma.celery_tasks.run_next_capture (argspec)', 'removed beat entry run-next-capture'])
+            self.run_action('celery-manifest-compare', [], {'base': base, 'incoming': '/missing.json'}, False)
+
+    def test_celery_task_manifest_inspects_offline(self):
+        document = {'format': 1, 'tasks': [{'name': 'perma.t', 'argspec': 'a', 'queue': 'celery'}], 'beat': {}}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'celery-tasks.json'
+            _, calls = self.run_action('celery-task-manifest', [reply('docker', document, contains=['run'])],
+                                       {'image': 'perma-prod:sha', 'output': str(output),
+                                        'environment': '{"PERMA_SETTINGS_MODULE":"settings_build"}'})
+            self.assertEqual(json.loads(output.read_text())['tasks'], {'perma.t': {'argspec': 'a', 'queue': 'celery'}})
+            args = calls[0]['args']
+            for flag in ['--network', 'none', '--read-only', 'PERMA_SETTINGS_MODULE=settings_build']:
+                self.assertIn(flag, args)
+            self.assertTrue(args[-1].startswith('python manage.py celery_task_manifest --output /tmp/'))
+            self.run_action('celery-task-manifest', [reply('docker', {'format': 2})],
+                            {'image': 'perma-prod:sha', 'output': str(output)}, False)
+
+    def test_celery_wait_idle(self):
+        prefix = [reply(output={'taskArns': ['task']}, contains=['list-tasks']),
+                  reply(output={'tasks': [{'lastStatus': 'RUNNING', 'taskDefinitionArn': ARN}]}, contains=['describe-tasks'])]
+        inputs = {'cluster': 'perma', 'service': 'web', 'container': 'web', 'app': 'perma', 'timeout-seconds': '0'}
+        for stdout, idle in [('{"w1@a": [], "w2@b": []}', 'true'), ('{"w1@a": [{"id": "1"}]}', 'false'),
+                             ('Error: No nodes replied\nCELERY_INSPECT_FAILED=69', 'false')]:
+            with self.subTest(stdout=stdout):
+                outputs, calls = self.run_action('celery-wait-idle', prefix + [
+                    reply(output=stdout, contains=['execute-command'], remote_status=0)], inputs)
+                self.assertEqual(outputs['idle'], idle)
+                self.assertNotIn('purge', calls[-1]['args'][calls[-1]['args'].index('--command') + 1])
+        self.run_action('celery-wait-idle', prefix + [reply(output='', contains=['execute-command'], remote_status=1)], inputs, False)
+
 
 if __name__ == '__main__':
     unittest.main()
