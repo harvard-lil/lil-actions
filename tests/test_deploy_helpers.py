@@ -117,6 +117,64 @@ class Helpers(unittest.TestCase):
             return parse_outputs(outputs.read_text()), result.stdout + result.stderr, state['calls']
 
 
+class StaticAssetsPublish(Helpers):
+    def archive(self, path, files, name='static-assets.tar.gz'):
+        with tarfile.open(path / name, 'w:gz') as tar:
+            for member in files:
+                data = member.encode()
+                info = tarfile.TarInfo(member)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+    def test_two_passes_with_hashed_subdir(self):
+        _, log, calls = self.run_action('static-assets-publish', {
+            'bucket': 'lil-h2o-static', 'archive': 'static-assets.tar.gz', 'hashed-subdir': 'dist'},
+            [reply(contains=['s3', 'sync', 'image-artifacts/static/dist', 's3://lil-h2o-static/static/dist',
+                             '--cache-control', 'public, max-age=31536000, immutable', '--no-progress']),
+             reply(contains=['s3', 'sync', 'image-artifacts/static', 's3://lil-h2o-static/static',
+                             '--exclude', 'dist/*', '--cache-control', 'public, max-age=3600'])],
+            prepare=lambda path: self.archive(path, ['static/dist/app.abc123.js', 'static/admin/base.css']))
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertNotIn('--delete', call['args'])
+        self.assertIn('Published image-artifacts/static to s3://lil-h2o-static/static', log)
+
+    def test_one_pass_without_hashed_subdir(self):
+        _, _, calls = self.run_action('static-assets-publish', {
+            'bucket': 'perma-static', 'archive': 'assets.tgz', 'extract-to': 'unpacked'},
+            [reply(contains=['s3', 'sync', 'unpacked/static', 's3://perma-static/static',
+                             '--cache-control', 'public, max-age=300', '--no-progress'])],
+            prepare=lambda path: self.archive(path, ['static/css/site.css'], 'assets.tgz'))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('--delete', calls[0]['args'])
+        self.assertNotIn('--exclude', calls[0]['args'])
+
+    def test_prefix_names_both_the_directory_and_the_keys(self):
+        _, _, calls = self.run_action('static-assets-publish', {
+            'bucket': 'b', 'archive': 'static-assets.tar.gz', 'prefix': 'assets'},
+            [reply(contains=['image-artifacts/assets', 's3://b/assets'])],
+            prepare=lambda path: self.archive(path, ['assets/x.css']))
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_archive_or_directories_fail_before_any_sync(self):
+        _, log, calls = self.run_action('static-assets-publish', {'bucket': 'b', 'archive': 'missing.tar.gz'}, ok=False)
+        self.assertIn("No archive at 'missing.tar.gz'", log)
+        self.assertEqual(calls, [])
+        _, log, calls = self.run_action('static-assets-publish', {'bucket': 'b', 'archive': 'static-assets.tar.gz'},
+                                        prepare=lambda path: self.archive(path, ['other/x.css']), ok=False)
+        self.assertIn("did not contain a 'static' directory", log)
+        self.assertEqual(calls, [])
+        _, log, calls = self.run_action('static-assets-publish', {'bucket': 'b', 'archive': 'static-assets.tar.gz',
+                                        'hashed-subdir': 'dist'}, prepare=lambda path: self.archive(path, ['static/x.css']), ok=False)
+        self.assertIn("No 'dist' directory", log)
+        self.assertEqual(calls, [])
+
+    def test_failed_sync_fails(self):
+        self.run_action('static-assets-publish', {'bucket': 'b', 'archive': 'static-assets.tar.gz'},
+                        [reply(output='AccessDenied', code=1)],
+                        prepare=lambda path: self.archive(path, ['static/x.css']), ok=False)
+
+
 class EcsScaleService(Helpers):
     def scale(self, mode, responses, ok=True, **extra):
         inputs = {'mode': mode, 'cluster': 'perma', 'service': 'beat', 'timeout-seconds': '0'} | extra
