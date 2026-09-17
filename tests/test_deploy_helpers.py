@@ -173,5 +173,51 @@ class EcsScaleService(Helpers):
         _, _, calls = self.scale('stop', [], ok=False, **{'timeout-seconds': 'soon'})
         self.assertEqual(calls, [])
 
+
+class DeployPreflight(Helpers):
+    def preflight(self, ok=True, **extra):
+        inputs = {'image-digest': DIGEST, 'source-sha': SHA, 'tier': 'staging',
+                  'required-secrets': json.dumps({'CLOUDFLARE_API_TOKEN': 'cf-secret-value', 'SLACK_WEBHOOK_URL': 'https://hooks/x'})} | extra
+        return self.run_action('deploy-preflight', inputs, ok=ok)
+
+    def test_well_formed_inputs_pass_without_printing_values(self):
+        _, log, _ = self.preflight()
+        self.assertIn('secret CLOUDFLARE_API_TOKEN: set', log)
+        self.assertIn('secret SLACK_WEBHOOK_URL: set', log)
+        self.assertNotIn('cf-secret-value', log)
+        self.assertNotIn('hooks/x', log)
+
+    def test_empty_secret_is_named_without_its_neighbour(self):
+        _, log, _ = self.preflight(ok=False, **{'required-secrets': json.dumps({'CLOUDFLARE_API_TOKEN': '', 'SLACK_WEBHOOK_URL': 'https://hooks/x'})})
+        self.assertIn('::error::required secret CLOUDFLARE_API_TOKEN is empty in the staging environment', log)
+        self.assertNotIn('SLACK_WEBHOOK_URL is empty', log)
+        self.assertNotIn('hooks/x', log)
+        _, log, _ = self.preflight(ok=False, **{'required-secrets': json.dumps({'TOKEN': None})})
+        self.assertIn('required secret TOKEN is not a string', log)
+
+    def test_shapes_and_tier(self):
+        for extra, message in [({'image-digest': 'sha256:short'}, 'image-digest is not a sha256 digest'),
+                               ({'image-digest': '123456789012.dkr.ecr.us-east-1.amazonaws.com/h2o@' + DIGEST}, 'image-digest'),
+                               ({'source-sha': SHA[:7]}, 'source-sha is not a 40-character commit SHA'),
+                               ({'tier': 'production'}, "tier 'production' is not one of staging, prod")]:
+            with self.subTest(extra=extra):
+                _, log, _ = self.preflight(ok=False, **extra)
+                self.assertIn(f'::error::{message}', log)
+        self.preflight(**{'tier': 'production', 'allowed-tiers': 'staging, production'})
+
+    def test_every_problem_is_reported_at_once(self):
+        _, log, _ = self.preflight(ok=False, **{'image-digest': '', 'source-sha': '', 'tier': '',
+                                                'required-secrets': json.dumps({'A': '', 'B': ' '})})
+        self.assertEqual(log.count('::error::'), 5)
+
+    def test_malformed_secrets_json_does_not_echo_it(self):
+        _, log, _ = self.preflight(ok=False, **{'required-secrets': '{"TOKEN":"cf-secret-value}'})
+        self.assertIn('required-secrets is not valid JSON', log)
+        self.assertNotIn('cf-secret-value', log)
+        _, log, _ = self.preflight(ok=False, **{'required-secrets': '["cf-secret-value"]'})
+        self.assertIn('must be a JSON object', log)
+        self.assertNotIn('cf-secret-value', log)
+
+
 if __name__ == '__main__':
     unittest.main()

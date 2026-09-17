@@ -1,0 +1,38 @@
+name: Check deploy inputs
+description: >
+  Fails before anything changes when the image digest or source SHA is the
+  wrong shape, the tier is not one of the allowed tiers, or a required secret
+  is empty in the selected environment. Names the failing input and never
+  prints a value. Shape and presence only; it does not probe API permissions.
+inputs:
+  image-digest:
+    required: true
+    description: 'Digest to deploy, sha256: followed by 64 hex characters'
+  source-sha:
+    required: true
+    description: Commit the artifact was built from, 40 hex characters
+  tier:
+    required: true
+    description: The tier being deployed, normally the environment input
+  allowed-tiers:
+    default: staging,prod
+    description: Comma-separated tiers the sequence may deploy to
+  required-secrets:
+    default: '{}'
+    description: >
+      JSON object of secret name to value, e.g.
+      {"CLOUDFLARE_API_TOKEN":"${{ secrets.CLOUDFLARE_API_TOKEN }}"}. Each
+      value must be non-empty. A value containing a double quote or backslash
+      would break the JSON; tokens and webhook URLs do not.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        IMAGE_DIGEST: ${{ inputs.image-digest }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        TIER: ${{ inputs.tier }}
+        ALLOWED_TIERS: ${{ inputs.allowed-tiers }}
+        REQUIRED_SECRETS: ${{ inputs.required-secrets }}
+      run: python3 "$ACTION_PATH/../scripts/deploy_preflight.py"
