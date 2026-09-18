@@ -630,13 +630,17 @@ integration, image contents, or application-specific deployment identities.
 
 ### Celery task manifests and idle workers
 
-`celery-task-manifest` runs the application's own manifest command
-(default `python manage.py celery_task_manifest --output`, with the container
-path appended) in a built image with no network, a read-only root and
-placeholder `environment`, and writes the format-1 result on the runner. The
-document lists registered tasks with an argument-signature hash and queue, and
-the beat schedule; the application defines it, this action only carries it.
-CI publishes it as an OCI referrer next to the migration manifest.
+`celery-task-manifest` describes a Celery app from a built image with no
+network, a read-only root and placeholder `environment`, and writes the
+format-1 result on the runner. Like `django-migration-manifest`, the
+inspection code lives here (`scripts/celery_task_inspect.py`, run in the image
+with `python -c`), so the application adds nothing: `app` is the value the
+workers pass to `celery -A`, resolved the same way Celery resolves it, and
+Django is set up first when the app configures itself from Django settings.
+The document lists registered tasks (Celery's own excluded) with a hash of
+each run function's parameters and the queue the app's router sends it to,
+and the beat schedule. CI publishes it as an OCI referrer next to the
+migration manifest.
 
 `celery-manifest-compare` takes two manifest paths and outputs `changed` and a
 one-line `summary` of added, removed and changed tasks and beat entries. A

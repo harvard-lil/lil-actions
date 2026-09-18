@@ -1,5 +1,5 @@
 name: Inspect an image's Celery tasks
-description: Run the application's Celery task manifest command in a built image, offline, and write the format-1 result on the runner.
+description: Describe a Celery app's registered tasks and beat schedule from a built image, offline, with shared inspection code, and write the format-1 result on the runner.
 inputs:
   image:
     required: true
@@ -7,9 +7,12 @@ inputs:
   output:
     default: celery-tasks.json
     description: Output manifest file
-  command:
-    default: python manage.py celery_task_manifest --output
-    description: Command that writes the manifest; the output path inside the container is appended
+  app:
+    required: true
+    description: The Celery app as `celery -A` takes it, e.g. `perma` or `proj.celery:app`
+  settings-module:
+    default: ''
+    description: Django settings module, if the app configures itself from Django; defaults to the image's configuration
   working-directory:
     default: ''
     description: Application directory; defaults to the image's working directory
@@ -24,7 +27,8 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         IMAGE: ${{ inputs.image }}
         MANIFEST: ${{ inputs.output }}
-        COMMAND: ${{ inputs.command }}
+        CELERY_APP: ${{ inputs.app }}
+        SETTINGS_MODULE: ${{ inputs.settings-module }}
         WORKING_DIRECTORY: ${{ inputs.working-directory }}
         IMAGE_ENVIRONMENT: ${{ inputs.environment }}
       run: python3 "$ACTION_PATH/../scripts/celery_manifest.py" inspect
