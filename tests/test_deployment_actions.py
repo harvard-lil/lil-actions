@@ -324,15 +324,19 @@ class Actions(unittest.TestCase):
         document = {'format': 1, 'tasks': [{'name': 'perma.t', 'argspec': 'a', 'queue': 'celery'}], 'beat': {}}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'celery-tasks.json'
-            _, calls = self.run_action('celery-task-manifest', [reply('docker', document, contains=['run'])],
-                                       {'image': 'perma-prod:sha', 'output': str(output),
+            _, calls = self.run_action('celery-task-manifest',
+                                       [reply('docker', 'startup noise\nCELERY_MANIFEST=' + json.dumps(document), contains=['run'])],
+                                       {'image': 'perma-prod:sha', 'output': str(output), 'app': 'perma',
                                         'environment': '{"PERMA_SETTINGS_MODULE":"settings_build"}'})
             self.assertEqual(json.loads(output.read_text())['tasks'], {'perma.t': {'argspec': 'a', 'queue': 'celery'}})
             args = calls[0]['args']
-            for flag in ['--network', 'none', '--read-only', 'PERMA_SETTINGS_MODULE=settings_build']:
+            for flag in ['--network', 'none', '--read-only', 'PERMA_SETTINGS_MODULE=settings_build', 'CELERY_APP=perma']:
                 self.assertIn(flag, args)
-            self.assertTrue(args[-1].startswith('python manage.py celery_task_manifest --output /tmp/'))
-            self.run_action('celery-task-manifest', [reply('docker', {'format': 2})],
+            # The inspector is this repository's source, not a command the application ships.
+            self.assertIn("find_app(os.environ['CELERY_APP'])", args[-1])
+            self.run_action('celery-task-manifest', [reply('docker', 'CELERY_MANIFEST={"format": 2}')],
+                            {'image': 'perma-prod:sha', 'output': str(output), 'app': 'perma'}, False)
+            self.run_action('celery-task-manifest', [],
                             {'image': 'perma-prod:sha', 'output': str(output)}, False)
 
     def test_celery_wait_idle(self):
