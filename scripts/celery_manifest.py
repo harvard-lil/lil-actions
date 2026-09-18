@@ -6,8 +6,10 @@ the running one to decide whether workers can be replaced without pausing
 intake: an unchanged manifest means the outgoing code's queued messages are
 ones the incoming code registers, with the same arguments, on the same queues.
 
-The application produces the document (Perma: `manage.py celery_task_manifest
---output <path>`); these helpers only validate, carry and compare it. Format 1:
+The document is produced inside the image by celery_task_inspect.py, which
+this module runs there with `python -c`, so applications carry no manifest
+code of their own (the same arrangement as django_manifest.py). These helpers
+also validate, carry and compare it. Format 1, in outline:
 
     {"format": 1,
      "tasks": {"<task name>": {"argspec": "<hash>", "queue": "<queue>"}},
@@ -50,27 +52,40 @@ def load(path):
     return normalise(json.loads(Path(path).read_text()))
 
 
+def source():
+    return Path(__file__).with_name('celery_task_inspect.py').read_text()
+
+
+def parse(output):
+    documents = [json.loads(line.removeprefix('CELERY_MANIFEST='))
+                 for line in output.replace('\r', '').splitlines()
+                 if line.startswith('CELERY_MANIFEST=')]
+    if len(documents) != 1:
+        raise ValueError('Expected one Celery task manifest')
+    return normalise(documents[0])
+
+
 def inspect_image():
-    """Run the application's manifest command in the image, offline, and return the document."""
+    """Run the shared inspector in the image, offline, and return the document."""
     environment = json.loads(os.environ.get('IMAGE_ENVIRONMENT', '{}'))
     if not isinstance(environment, dict) or any(
         not isinstance(key, str) or not key or '=' in key or not isinstance(value, str)
         for key, value in environment.items()
     ):
         raise ValueError('Image environment must be a JSON object of string values')
-    command = os.environ.get('COMMAND') or 'python manage.py celery_task_manifest --output'
-    # The command writes the document to a file in the container's tmpfs and
-    # the file is then printed, so stdout holds exactly the document: nothing
-    # the command itself prints while running can be mistaken for it.
-    script = f'{command} /tmp/celery-tasks.json >&2 && cat /tmp/celery-tasks.json'
+    if not os.environ.get('CELERY_APP'):
+        raise ValueError('Name the Celery app as `celery -A` takes it')
     args = ['docker', 'run', '--rm', '--network', 'none', '--read-only', '--tmpfs', '/tmp',
-            '--entrypoint', '/bin/sh']
+            '--entrypoint', 'python']
     for key, value in environment.items():
         args += ['--env', f'{key}={value}']
+    args += ['--env', 'CELERY_APP=' + os.environ['CELERY_APP']]
+    if os.environ.get('SETTINGS_MODULE'):
+        args += ['--env', 'DJANGO_SETTINGS_MODULE=' + os.environ['SETTINGS_MODULE']]
     if os.environ.get('WORKING_DIRECTORY'):
         args += ['--workdir', os.environ['WORKING_DIRECTORY']]
-    args += [os.environ['IMAGE'], '-c', script]
-    return normalise(json.loads(subprocess.check_output(args, text=True)))
+    args += [os.environ['IMAGE'], '-c', source()]
+    return parse(subprocess.check_output(args, text=True))
 
 
 def compare(base, incoming):
