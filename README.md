@@ -401,6 +401,12 @@ variables, and registers a new revision. Outputs the new task definition ARN —
 useful when you need a pinned ARN for EventBridge rules or explicit service
 updates.
 
+`images` sets several containers' images in the one revision, as a JSON object
+of container names to URIs. Use it when a task's containers ship different
+images that are only tested together: two calls would register an intermediate
+revision pairing one new image with one old one, and that revision becomes the
+family's newest.
+
 ### `ecs-update-eventbridge`
 
 Updates `EcsParameters.TaskDefinitionArn` on one or more EventBridge rules.

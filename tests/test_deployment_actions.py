@@ -25,6 +25,8 @@ call = {'tool': tool, 'args': args}
 if '--targets' in args:
     value = args[args.index('--targets') + 1]
     call['targets'] = json.loads(pathlib.Path(value[7:]).read_text()) if value.startswith('file://') else json.loads(value)
+if '--cli-input-json' in args:
+    call['input'] = json.loads(pathlib.Path(args[args.index('--cli-input-json') + 1][7:]).read_text())
 state['calls'].append(call)
 if not state['responses']:
     state['error'] = 'Unexpected extra CLI call'
@@ -164,6 +166,51 @@ class Actions(unittest.TestCase):
         responses = self.resolve_responses()
         responses[-1] = described(service(pendingCount=1))
         self.resolve(responses, False)
+
+    def task_definition(self):
+        return {
+            'taskDefinitionArn': ARN, 'revision': 42, 'status': 'ACTIVE', 'family': 'capture',
+            'containerDefinitions': [
+                {'name': 'capture', 'image': 'old-capture', 'environment': [{'name': 'KEEP', 'value': '1'}]},
+                {'name': 'sidecar', 'image': 'old-sidecar'},
+                {'name': 'log-router', 'image': 'fluent-bit'},
+            ],
+        }
+
+    def register(self, inputs, ok=True):
+        responses = [reply(output=self.task_definition(), contains=['describe-task-definition'])]
+        if ok:
+            responses.append(reply(output=ARN.replace(':42', ':43'), contains=['register-task-definition']))
+        return self.run_action('ecs-register-task-def', responses,
+                               {'task-definition-family': 'capture'} | inputs, ok)
+
+    def test_register_sets_several_images_in_one_revision(self):
+        outputs, calls = self.register({'images': json.dumps(
+            {'capture': f'{REPOSITORY}@{DIGEST}', 'sidecar': f'{REPOSITORY}-sidecar@{DIGEST}'})})
+        registered = calls[1]['input']
+        images = {c['name']: c['image'] for c in registered['containerDefinitions']}
+        self.assertEqual(images, {'capture': f'{REPOSITORY}@{DIGEST}',
+                                  'sidecar': f'{REPOSITORY}-sidecar@{DIGEST}', 'log-router': 'fluent-bit'})
+        self.assertNotIn('revision', registered)
+        self.assertNotIn('taskDefinitionArn', registered)
+        self.assertEqual(outputs['task-definition-arn'], ARN.replace(':42', ':43'))
+
+    def test_register_refuses_an_unknown_container_before_registering(self):
+        _, calls = self.register({'images': json.dumps({'capture': 'new', 'sidecr': 'new'})}, ok=False)
+        self.assertEqual(len(calls), 1)
+
+    def test_register_refuses_malformed_images(self):
+        for images in ['[]', '{"capture": ""}', '{"capture": 1}']:
+            with self.subTest(images=images):
+                self.register({'images': images}, ok=False)
+
+    def test_register_combines_images_with_environment(self):
+        _, calls = self.register({'images': json.dumps({'sidecar': 'new-sidecar'}), 'container-name': 'capture',
+                                  'image-uri': 'new-capture', 'environment-variables': '{"ADDED": "2"}'})
+        capture = calls[1]['input']['containerDefinitions'][0]
+        self.assertEqual(capture['image'], 'new-capture')
+        self.assertEqual(capture['environment'], [{'name': 'KEEP', 'value': '1'}, {'name': 'ADDED', 'value': '2'}])
+        self.assertEqual(calls[1]['input']['containerDefinitions'][1]['image'], 'new-sidecar')
 
     def test_schedule_preserves_target_fields(self):
         target = dict(Id='job', Arn='cluster', RoleArn='role', Input='{}',

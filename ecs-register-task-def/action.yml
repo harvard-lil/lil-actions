@@ -1,7 +1,7 @@
 name: 'Register new ECS task definition revision'
 description: >
   Fetches the current revision of an ECS task definition, strips read-only fields,
-  optionally updates a container image URI and environment variables, and registers
+  optionally updates container image URIs and environment variables, and registers
   a new revision.
   Outputs the new task definition ARN.
 
@@ -21,6 +21,13 @@ inputs:
     description: 'JSON object of environment variable names and values to set on the selected container.'
     required: false
     default: '{}'
+  images:
+    description: >
+      JSON object mapping container names to image URIs, for a task whose
+      containers ship different images that must change in one revision.
+      Every named container must exist. Applied after image-uri.
+    required: false
+    default: '{}'
 
 outputs:
   task-definition-arn:
@@ -38,6 +45,7 @@ runs:
         IMAGE_URI: ${{ inputs.image-uri }}
         CONTAINER_NAME: ${{ inputs.container-name }}
         ENVIRONMENT_VARIABLES: ${{ inputs.environment-variables }}
+        IMAGES: ${{ inputs.images }}
       run: |
         TASK_DEF_FILE="task-def-${FAMILY}.json"
 
@@ -61,6 +69,26 @@ runs:
             jq --arg image "$IMAGE_URI" '.containerDefinitions[].image = $image' \
               "$TASK_DEF_FILE" > "${TASK_DEF_FILE}.tmp"
           fi
+          mv "${TASK_DEF_FILE}.tmp" "$TASK_DEF_FILE"
+        fi
+
+        if [ "$IMAGES" != "{}" ]; then
+          if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and length > 0)' \
+            <<< "$IMAGES" >/dev/null; then
+            echo "images must be a JSON object of container names to non-empty image URIs" >&2
+            exit 1
+          fi
+
+          missing=$(jq -r --argjson images "$IMAGES" \
+            '[$images | keys[]] - [.containerDefinitions[].name] | join(" ")' "$TASK_DEF_FILE")
+          if [ -n "$missing" ]; then
+            echo "containers not found in task definition $FAMILY: $missing" >&2
+            exit 1
+          fi
+
+          jq --argjson images "$IMAGES" \
+            '.containerDefinitions |= map(.image = ($images[.name] // .image))' \
+            "$TASK_DEF_FILE" > "${TASK_DEF_FILE}.tmp"
           mv "${TASK_DEF_FILE}.tmp" "$TASK_DEF_FILE"
         fi
 
