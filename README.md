@@ -139,10 +139,6 @@ expected `CLOUDFLARE_API_TOKEN` environment variable:
     CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_TOKEN }}
 ```
 
-### `docker-compose-update`
-
-Updates image tags in `docker-compose.yml` / `docker-compose.override.yml` based on content hashes, then builds and optionally pushes via `docker buildx bake`. Used by projects that track images in `registry.lil.tools`.
-
 ### `ecs-build`
 
 Logs in to AWS ECR, builds a Docker image, and pushes it tagged with both the
