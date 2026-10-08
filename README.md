@@ -139,6 +139,14 @@ expected `CLOUDFLARE_API_TOKEN` environment variable:
     CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_TOKEN }}
 ```
 
+With `skip-unchanged: true`, a production deployment is skipped when the
+directory's files are identical to the project's live production deployment.
+Each deployment records `content-sha256:<hash>` (over file paths and contents)
+in its commit message, and the live deployment's message is checked for the
+same hash. This suits a site redeployed by every release of a larger
+application but rarely changed itself. The `deployed` output says whether a
+deployment was made.
+
 ### `ecs-build`
 
 Logs in to AWS ECR, builds a Docker image, and pushes it tagged with both the

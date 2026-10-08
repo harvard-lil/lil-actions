@@ -12,24 +12,73 @@ inputs:
     description: Cloudflare Pages deployment branch; defaults to the GitHub ref name
     required: false
     default: ""
+  skip-unchanged:
+    description: >
+      If "true", skip a production deployment whose files are identical to the
+      project's current production deployment. The directory's content hash is
+      recorded in each deployment's commit message and compared with the one
+      in the live deployment; deployments made without this option have none
+      and are always replaced.
+    required: false
+    default: "false"
+
+outputs:
+  deployed:
+    description: '"true" if a deployment was made, "false" if it was skipped as unchanged'
+    value: ${{ steps.deploy.outputs.deployed }}
+  content-hash:
+    description: SHA-256 over the directory's file paths and contents
+    value: ${{ steps.deploy.outputs.content-hash }}
 
 runs:
   using: composite
   steps:
     - name: Deploy static site
+      id: deploy
       shell: bash
       env:
         INPUT_PROJECT_NAME: ${{ inputs.project-name }}
         INPUT_DIRECTORY: ${{ inputs.directory }}
         INPUT_BRANCH: ${{ inputs.branch }}
+        INPUT_SKIP_UNCHANGED: ${{ inputs.skip-unchanged }}
       run: |
         set -euo pipefail
         : "${CLOUDFLARE_ACCOUNT_ID:?Set CLOUDFLARE_ACCOUNT_ID in the step environment}"
         : "${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in the step environment}"
 
         branch="${INPUT_BRANCH:-${GITHUB_REF_NAME}}"
+
+        # Paths are hashed along with contents, so a rename or a removed file
+        # changes the hash too.
+        content_hash="$(cd "${INPUT_DIRECTORY}" \
+          && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum \
+          | sha256sum | cut -d' ' -f1)"
+        echo "content-hash=${content_hash}" >> "$GITHUB_OUTPUT"
+        marker="content-sha256:${content_hash}"
+
+        if [ "${INPUT_SKIP_UNCHANGED}" = "true" ]; then
+          response="$(mktemp)"
+          status="$(curl -sS -o "$response" -w '%{http_code}' \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${INPUT_PROJECT_NAME}")"
+          if [ "$status" != "200" ] || [ "$(jq -r '.success' < "$response")" != "true" ]; then
+            echo "::error::Could not read Pages project ${INPUT_PROJECT_NAME} (HTTP ${status})"
+            cat "$response"
+            exit 1
+          fi
+          production_branch="$(jq -r '.result.production_branch' < "$response")"
+          live_message="$(jq -r '.result.canonical_deployment.deployment_trigger.metadata.commit_message // ""' < "$response")"
+          if [ "$branch" = "$production_branch" ] && [[ "$live_message" == *"${marker}"* ]]; then
+            echo "Production deployment of ${INPUT_PROJECT_NAME} already has ${marker}; skipping."
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        fi
+
         npx --yes wrangler@4.114.0 pages deploy "${INPUT_DIRECTORY}" \
           --project-name "${INPUT_PROJECT_NAME}" \
           --branch "${branch}" \
           --commit-hash "${GITHUB_SHA}" \
+          --commit-message "${marker} ${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
           --commit-dirty=false
+        echo "deployed=true" >> "$GITHUB_OUTPUT"
