@@ -1,0 +1,68 @@
+name: Publish static assets to S3
+description: >
+  Unpacks the static-file archive an image carries (fetched by ecr-artifacts)
+  and syncs it into a bucket that every deployed version shares. Objects are
+  only ever added, never deleted, so a browser holding a page from an earlier
+  deploy can still fetch that page's files. With hashed-subdir set, that
+  subtree is cached for a year as immutable and the rest for an hour; without
+  it, everything gets five minutes. Run it before the rollout, so no task
+  serves a page whose files are not in the bucket yet. AWS credentials must be
+  configured before this action runs.
+inputs:
+  bucket:
+    required: true
+    description: S3 bucket name
+  archive:
+    required: true
+    description: Path to the tar.gz of collected static files, as ecr-artifacts wrote it
+  prefix:
+    default: static
+    description: Top-level directory inside the archive, and the key prefix it is published under
+  hashed-subdir:
+    default: ''
+    description: Subdirectory of prefix whose filenames carry content hashes, e.g. dist; cached as immutable when set
+  extract-to:
+    default: image-artifacts
+    description: Directory the archive is unpacked into
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        ARCHIVE: ${{ inputs.archive }}
+        PREFIX: ${{ inputs.prefix }}
+        HASHED_SUBDIR: ${{ inputs.hashed-subdir }}
+        EXTRACT_TO: ${{ inputs.extract-to }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$ARCHIVE" ]; then
+          echo "::error::No archive at '${ARCHIVE}'."
+          exit 1
+        fi
+        mkdir -p "$EXTRACT_TO"
+        tar -xzf "$ARCHIVE" -C "$EXTRACT_TO"
+        source="${EXTRACT_TO}/${PREFIX}"
+        if [ ! -d "$source" ]; then
+          echo "::error::The archive did not contain a '${PREFIX}' directory."
+          exit 1
+        fi
+
+        # No --delete on any pass: removing an old hash is what this bucket
+        # exists to prevent.
+        if [ -n "$HASHED_SUBDIR" ]; then
+          if [ ! -d "${source}/${HASHED_SUBDIR}" ]; then
+            echo "::error::No '${HASHED_SUBDIR}' directory under '${source}' to publish as immutable."
+            exit 1
+          fi
+          aws s3 sync "${source}/${HASHED_SUBDIR}" "s3://${BUCKET}/${PREFIX}/${HASHED_SUBDIR}" \
+            --cache-control 'public, max-age=31536000, immutable' --no-progress
+          aws s3 sync "$source" "s3://${BUCKET}/${PREFIX}" \
+            --exclude "${HASHED_SUBDIR}/*" \
+            --cache-control 'public, max-age=3600' --no-progress
+        else
+          aws s3 sync "$source" "s3://${BUCKET}/${PREFIX}" \
+            --cache-control 'public, max-age=300' --no-progress
+        fi
+        echo "Published ${source} to s3://${BUCKET}/${PREFIX}"

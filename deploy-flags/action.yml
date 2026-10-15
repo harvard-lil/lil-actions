@@ -1,0 +1,65 @@
+name: Resolve deploy flags
+description: >
+  Reads the pull request labels behind the deployed commit, the
+  workflow_dispatch inputs and a standing repository or environment variable,
+  and resolves them into force, skip and hold maintenance flags with a record
+  of where each true value came from. Set GH_TOKEN in the calling step's env;
+  the label lookup needs pull-requests read permission.
+inputs:
+  event-name:
+    required: true
+    description: The workflow's github.event_name; dispatch inputs are honoured only when it is workflow_dispatch
+  inputs:
+    default: '{}'
+    description: JSON of the workflow's inputs context, normally toJSON(inputs)
+  hold-variable:
+    default: ''
+    description: Value of the standing hold variable, normally vars.HOLD_MAINTENANCE; the string true holds
+  label-prefix:
+    default: 'deploy:'
+    description: Prefix every deploy label carries
+  force-label:
+    default: force-maintenance-mode
+    description: Label, after the prefix, that forces a maintenance window
+  skip-label:
+    default: skip-maintenance-mode
+    description: Label, after the prefix, that asserts migrations are compatible with serving traffic
+  input-force:
+    default: force-maintenance
+    description: Key in inputs that forces a maintenance window
+  input-skip:
+    default: skip-maintenance
+    description: Key in inputs that asserts migrations are compatible with serving traffic
+  input-hold:
+    default: hold-maintenance
+    description: Key in inputs that keeps traffic held after a successful deploy
+outputs:
+  force:
+    description: true when a maintenance window is required; hold implies it
+    value: ${{ steps.flags.outputs.force }}
+  skip:
+    description: true when the window is asserted unnecessary and nothing forces one
+    value: ${{ steps.flags.outputs.skip }}
+  hold:
+    description: true when traffic stays held after a successful deploy
+    value: ${{ steps.flags.outputs.hold }}
+  sources:
+    description: One line naming where each true flag came from, or none
+    value: ${{ steps.flags.outputs.sources }}
+runs:
+  using: composite
+  steps:
+    - id: flags
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        EVENT_NAME: ${{ inputs.event-name }}
+        DISPATCH_INPUTS: ${{ inputs.inputs }}
+        HOLD_VARIABLE: ${{ inputs.hold-variable }}
+        LABEL_PREFIX: ${{ inputs.label-prefix }}
+        FORCE_LABEL: ${{ inputs.force-label }}
+        SKIP_LABEL: ${{ inputs.skip-label }}
+        INPUT_FORCE: ${{ inputs.input-force }}
+        INPUT_SKIP: ${{ inputs.input-skip }}
+        INPUT_HOLD: ${{ inputs.input-hold }}
+      run: python3 "$ACTION_PATH/../scripts/deploy_flags.py"

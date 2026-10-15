@@ -1,11 +1,14 @@
 name: 'Update EventBridge rules with new ECS task definition'
 description: >
   Updates EcsParameters.TaskDefinitionArn on one or more EventBridge rules
-  to point at a new task definition revision. Each rule is assumed to have
-  exactly one target; rules with multiple targets are not supported and
-  additional targets would be dropped.
+  to point at a new task definition revision. Refuses ambiguous targets,
+  preserves all target fields, and verifies the update. Rule state is unchanged.
 
 inputs:
+  target-id:
+    description: 'Optional target ID to update in every named rule. Without it, each rule must have exactly one target.'
+    required: false
+    default: ''
   event-rules:
     description: 'Comma-separated list of EventBridge rule names to update'
     required: true
@@ -19,17 +22,41 @@ runs:
     - name: Update EventBridge rules
       shell: bash
       env:
+        TARGET_ID: ${{ inputs.target-id }}
         EVENT_RULES: ${{ inputs.event-rules }}
         TASK_DEF_ARN: ${{ inputs.task-definition-arn }}
       run: |
+        set -euo pipefail
+        if [ -z "$EVENT_RULES" ] || [ -z "$TASK_DEF_ARN" ]; then
+          echo "::error::event-rules and task-definition-arn must be nonempty."
+          exit 1
+        fi
         IFS=',' read -ra RULES <<< "$EVENT_RULES"
-        for RULE in "${RULES[@]}"; do
-          TARGETS=$(aws events list-targets-by-rule --rule "$RULE")
-          UPDATED=$(echo "$TARGETS" \
-            | jq --arg arn "$TASK_DEF_ARN" \
-              '[.Targets[0]
-                | .EcsParameters.TaskDefinitionArn = $arn
-                | {Id, Arn, RoleArn, Input, EcsParameters}
-                | with_entries(select(.value != null))]')
-          aws events put-targets --rule "$RULE" --targets "$UPDATED" > /dev/null
+        work_dir="$(mktemp -d)"
+        trap 'rm -rf "$work_dir"' EXIT
+        # Resolve every target before making any writes, including multi-rule calls.
+        for index in "${!RULES[@]}"; do
+          rule="${RULES[$index]}"
+          targets="$(aws events list-targets-by-rule --rule "$rule" --output json)"
+          selected="$(jq -ce --arg id "$TARGET_ID" '
+            .Targets | if $id == "" then . else map(select(.Id == $id)) end |
+            if length == 1 and .[0].EcsParameters != null then .
+            else error("expected exactly one matching ECS target") end
+          ' <<< "$targets")"
+          jq --arg arn "$TASK_DEF_ARN" '.[0].EcsParameters.TaskDefinitionArn = $arn'             <<< "$selected" > "$work_dir/$index.json"
+        done
+        for index in "${!RULES[@]}"; do
+          rule="${RULES[$index]}"
+          result="$(aws events put-targets --rule "$rule" --targets "file://$work_dir/$index.json" --output json)"
+          if ! jq -e '.FailedEntryCount == 0' <<< "$result" >/dev/null; then
+            echo "::error::EventBridge rejected the update for $rule."
+            exit 1
+          fi
+          actual="$(aws events list-targets-by-rule --rule "$rule" --output json)"
+          if ! jq -e --slurpfile expected "$work_dir/$index.json" '
+            [.Targets[] | select(.Id == $expected[0][0].Id)] == $expected[0]
+          ' <<< "$actual" >/dev/null; then
+            echo "::error::EventBridge did not retain the requested target for $rule."
+            exit 1
+          fi
         done

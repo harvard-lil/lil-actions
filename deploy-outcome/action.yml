@@ -1,0 +1,57 @@
+name: Report the deploy outcome
+description: >
+  Reads whether a maintenance window opened, whether a hold was requested and
+  the outcomes of the migrate and release steps, and says what the run left
+  behind. Fails the run when the site is behind the maintenance page and
+  nobody asked for that; emits a notice for a deliberate hold; is silent
+  otherwise. Outputs a Slack-ready summary for deploy-notify. It does not
+  touch Cloudflare: the caller keeps its release step. Run it with
+  `if: always()` directly after that step.
+inputs:
+  window:
+    required: true
+    description: Whether a maintenance window opened, normally ecs-django-maintenance's needed output
+  hold:
+    default: 'false'
+    description: Whether the deployer asked to keep traffic held, normally deploy-flags' hold output
+  migrate-outcome:
+    required: true
+    description: steps.<migrate>.outcome; success or skipped means the schema is consistent with the running code
+  release-outcome:
+    required: true
+    description: steps.<release>.outcome of the cloudflare-maintenance off step
+  site-url:
+    required: true
+    description: The site the maintenance page stands in front of, for the report
+  extra-lines:
+    default: ''
+    description: Newline-separated statements the caller adds to the state list, such as a scheduler's or intake's state
+  extra-left-behind:
+    default: 'false'
+    description: true when one of the extra lines describes something the caller left switched off; fails the run
+  sources:
+    default: ''
+    description: deploy-flags' sources output, reported alongside the state
+outputs:
+  summary:
+    description: Multi-line Slack mrkdwn describing the state, without the payload envelope
+    value: ${{ steps.outcome.outputs.summary }}
+  left-behind:
+    description: true when the run left the site behind the page unintentionally, or extra-left-behind was set
+    value: ${{ steps.outcome.outputs.left-behind }}
+runs:
+  using: composite
+  steps:
+    - id: outcome
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        WINDOW: ${{ inputs.window }}
+        HOLD: ${{ inputs.hold }}
+        MIGRATE_OUTCOME: ${{ inputs.migrate-outcome }}
+        RELEASE_OUTCOME: ${{ inputs.release-outcome }}
+        SITE_URL: ${{ inputs.site-url }}
+        EXTRA_LINES: ${{ inputs.extra-lines }}
+        EXTRA_LEFT_BEHIND: ${{ inputs.extra-left-behind }}
+        SOURCES: ${{ inputs.sources }}
+      run: python3 "$ACTION_PATH/../scripts/deploy_outcome.py"

@@ -1,0 +1,64 @@
+name: Decide Django maintenance window
+description: Compare the incoming migration manifest with a running task and check pending migrations; unknown state requires maintenance.
+inputs:
+  cluster:
+    required: true
+    description: ECS cluster
+  service:
+    required: true
+    description: ECS service
+  container:
+    required: true
+    description: Application container
+  manifest:
+    required: false
+    default: ''
+    description: Existing format-1 manifest path; supply either manifest or image
+  image:
+    default: ''
+    description: Incoming image to inspect when no manifest file is supplied
+  settings-module:
+    default: ''
+    description: Django settings module; defaults to each container's configuration
+  working-directory:
+    default: ''
+    description: Application directory; defaults to each container's working directory
+  environment:
+    default: '{}'
+    description: JSON placeholder environment for image inspection only; no production credentials
+  force:
+    default: 'false'
+    description: Require maintenance, taking precedence over skip
+  skip:
+    default: 'false'
+    description: Explicitly assert that migrations can run while serving traffic
+  manifest-command:
+    default: ''
+    description: Optional legacy manifest command; defaults to the shared inspector
+  check-command:
+    default: python manage.py migrate --plan
+    description: Command printing Django's migration plan
+outputs:
+  needed:
+    description: Whether the workflow should enter maintenance
+    value: ${{ steps.check.outputs.needed }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER: ${{ inputs.container }}
+        MANIFEST: ${{ inputs.manifest }}
+        IMAGE: ${{ inputs.image }}
+        SETTINGS_MODULE: ${{ inputs.settings-module }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        IMAGE_ENVIRONMENT: ${{ inputs.environment }}
+        FORCE: ${{ inputs.force }}
+        SKIP: ${{ inputs.skip }}
+        MANIFEST_COMMAND: ${{ inputs.manifest-command }}
+        CHECK_COMMAND: ${{ inputs.check-command }}
+      run: python3 "$ACTION_PATH/../scripts/ecs_django.py" maintenance

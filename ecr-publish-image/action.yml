@@ -1,0 +1,95 @@
+name: 'Publish an existing local image to ECR'
+description: >
+  Pushes an already-built local Docker image under one immutable ECR tag. It
+  refuses to replace an existing tag, keeping build and test orchestration in
+  the caller while making the publication boundary reusable. AWS credentials
+  and Docker's ECR login must be configured before this action runs.
+
+inputs:
+  repository:
+    description: 'ECR repository name'
+    required: true
+  registry:
+    description: 'ECR registry hostname, normally the output of amazon-ecr-login'
+    required: true
+  local-image:
+    description: 'Local Docker image name or ID that the caller already tested'
+    required: true
+  tag:
+    description: 'Immutable ECR tag to publish, normally a commit SHA'
+    required: true
+
+outputs:
+  digest:
+    description: 'Digest assigned to the published image manifest'
+    value: ${{ steps.publish.outputs.digest }}
+  image-uri:
+    description: 'Digest-pinned URI of the published image'
+    value: ${{ steps.publish.outputs.image-uri }}
+
+runs:
+  using: composite
+  steps:
+    - name: Publish local image
+      id: publish
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        LOCAL_IMAGE: ${{ inputs.local-image }}
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+
+        registry_host="${REGISTRY#https://}"
+        registry_host="${registry_host%/}"
+        if [ -z "$registry_host" ] || [ -z "$TAG" ]; then
+          echo "::error::registry and tag must be nonempty."
+          exit 1
+        fi
+        if ! docker image inspect "$LOCAL_IMAGE" >/dev/null 2>&1; then
+          echo "::error::Local image '$LOCAL_IMAGE' does not exist."
+          exit 1
+        fi
+
+        # Replacing a commit tag would sever the link between the tests the
+        # caller ran and the bytes later deployments resolve. A missing image
+        # is expected; any other AWS error leaves the answer unknown.
+        set +e
+        describe_output="$(aws ecr describe-images \
+          --repository-name "$REPOSITORY" \
+          --image-ids "imageTag=$TAG" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text 2>&1)"
+        describe_status="$?"
+        set -e
+        if [ "$describe_status" -eq 0 ]; then
+          echo "::error::$REPOSITORY:$TAG already exists at $describe_output."
+          echo "::error::Inspect its publication state and reuse it instead of replacing it."
+          exit 1
+        fi
+        if ! grep -Fq 'ImageNotFoundException' <<< "$describe_output"; then
+          echo "::error::Could not determine whether $REPOSITORY:$TAG already exists."
+          echo "$describe_output" >&2
+          exit "$describe_status"
+        fi
+
+        tagged_image="${registry_host}/${REPOSITORY}:${TAG}"
+        docker tag "$LOCAL_IMAGE" "$tagged_image"
+        docker push "$tagged_image"
+
+        digest="$(aws ecr describe-images \
+          --repository-name "$REPOSITORY" \
+          --image-ids "imageTag=$TAG" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)"
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::ECR returned an invalid digest after publishing $tagged_image: $digest"
+          exit 1
+        fi
+
+        echo "Published $tagged_image at $digest."
+        {
+          echo "digest=$digest"
+          echo "image-uri=${registry_host}/${REPOSITORY}@${digest}"
+        } >> "$GITHUB_OUTPUT"

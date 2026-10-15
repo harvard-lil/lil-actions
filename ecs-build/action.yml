@@ -10,13 +10,45 @@ inputs:
     description: 'ECR repository name (not the full URI)'
     required: true
   dockerfile:
-    description: 'Path to Dockerfile'
+    description: >
+      Path to the Dockerfile, relative to the workspace root (not to `context`).
+      When you set a non-default `context` you usually need to set this too.
     required: false
     default: 'Dockerfile'
+  context:
+    description: >
+      Build context directory, relative to the workspace root. Defaults to the
+      repository root. Set this for an image whose build context is a
+      subdirectory, e.g. a Lambda image under docker/<name>/.
+    required: false
+    default: '.'
+  provenance:
+    description: >
+      Passed through to buildx --provenance. Defaults to "false", which is what
+      every caller has effectively been getting: the docker driver attaches no
+      attestations, so nothing published through this action has ever been an
+      image index. Now that a container-driver builder is set up above, buildx's
+      own default would start attaching provenance -- turning each push into an
+      index, changing its digest, and breaking AWS Lambda, which rejects those
+      with "The image manifest, config or layer media type for the source image
+      is not supported". Set it explicitly to opt in.
+    required: false
+    default: 'false'
   image-tag:
-    description: 'Named tag to apply'
+    description: >
+      Named tag to apply alongside the commit SHA. Set to an empty string to
+      push only the SHA tag -- required for a repository with immutable tags,
+      where re-pushing a moving tag like `latest` fails the build, and sensible
+      anywhere the named tag has no consumer.
     required: false
     default: 'latest'
+  target:
+    description: >
+      Dockerfile stage to build. Leave empty for a single-stage Dockerfile.
+      Set this for any multi-stage Dockerfile: without --target, buildx builds
+      the LAST stage in the file, which is rarely the deployable one.
+    required: false
+    default: ''
 
 outputs:
   image-uri:
@@ -29,9 +61,25 @@ outputs:
 runs:
   using: composite
   steps:
+    # Build on a builder this action created, not on whatever the calling job
+    # happens to have left as the default. Without this, adding a
+    # setup-buildx-action step anywhere in a caller's workflow silently changes
+    # the driver this build runs on -- which is exactly what happened to h2o,
+    # moving its pandoc-lambda build from the docker driver to a container one
+    # as a side effect of an unrelated change.
+    #
+    # `use: false` keeps that symmetric: this does not become the caller's
+    # default either. The generated name is unique, so a job may call this
+    # action more than once.
+    - name: Set up a builder for this build
+      id: buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      with:
+        use: false
+
     - name: Login to AWS ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6
+      uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
     - name: Build and push docker image to AWS ECR
       id: build-push
@@ -41,24 +89,49 @@ runs:
         REPOSITORY: ${{ inputs.ecr-repository }}
         IMAGE_TAG: ${{ inputs.image-tag }}
         DOCKERFILE: ${{ inputs.dockerfile }}
+        TARGET: ${{ inputs.target }}
+        CONTEXT: ${{ inputs.context }}
+        PROVENANCE: ${{ inputs.provenance }}
+        BUILDER: ${{ steps.buildx.outputs.name }}
       run: |
         set -euo pipefail
 
-        IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
-        SHA_TAG="${GITHUB_SHA:-$IMAGE_TAG}"
+        SHA_TAG="${GITHUB_SHA:-${IMAGE_TAG:-latest}}"
         SHA_IMAGE_URI="$REGISTRY/$REPOSITORY:$SHA_TAG"
-        TAGS=(-t "$IMAGE_URI")
 
-        if [ "$SHA_IMAGE_URI" != "$IMAGE_URI" ]; then
-          TAGS+=(-t "$SHA_IMAGE_URI")
+        # The SHA tag is always applied; it is the one that identifies the build.
+        TAGS=(-t "$SHA_IMAGE_URI")
+
+        if [ -n "$IMAGE_TAG" ]; then
+          IMAGE_URI="$REGISTRY/$REPOSITORY:$IMAGE_TAG"
+          if [ "$IMAGE_URI" != "$SHA_IMAGE_URI" ]; then
+            TAGS+=(-t "$IMAGE_URI")
+          fi
+        else
+          # No named tag requested, so the SHA tag is the only one and is what
+          # the image-uri output reports.
+          IMAGE_URI="$SHA_IMAGE_URI"
+        fi
+
+        TARGET_ARGS=()
+        if [ -n "$TARGET" ]; then
+          TARGET_ARGS=(--target "$TARGET")
+        fi
+
+        PROVENANCE_ARGS=()
+        if [ -n "$PROVENANCE" ]; then
+          PROVENANCE_ARGS=(--provenance "$PROVENANCE")
         fi
 
         docker buildx build \
+          --builder "$BUILDER" \
           --platform linux/amd64 \
+          "${TARGET_ARGS[@]}" \
+          "${PROVENANCE_ARGS[@]}" \
           "${TAGS[@]}" \
           -f "$DOCKERFILE" \
           --push \
-          .
+          "$CONTEXT"
 
         echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
         echo "sha-image-uri=$SHA_IMAGE_URI" >> "$GITHUB_OUTPUT"

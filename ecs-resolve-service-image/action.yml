@@ -1,0 +1,100 @@
+name: 'Resolve the image running in an ECS service'
+description: >
+  Reads the task definition selected by an ECS service, requires the named
+  container to use a digest-pinned image from the expected ECR repository, and
+  recovers the commit SHA tag attached to that digest.
+
+inputs:
+  cluster:
+    description: 'ECS cluster containing the source service'
+    required: true
+  service:
+    description: 'ECS service whose selected task definition is authoritative'
+    required: true
+  container-name:
+    description: 'Container whose image should be resolved'
+    required: true
+  ecr-repository:
+    description: 'ECR repository the source image must come from'
+    required: true
+
+outputs:
+  task-definition-arn:
+    description: 'Task definition selected by the source service'
+    value: ${{ steps.resolve.outputs.task-definition-arn }}
+  image-uri:
+    description: 'Digest-pinned image URI read from the task definition'
+    value: ${{ steps.resolve.outputs.image-uri }}
+  image-digest:
+    description: 'Resolved image digest, including the sha256: prefix'
+    value: ${{ steps.resolve.outputs.image-digest }}
+  source-sha:
+    description: 'Commit SHA tag attached to the resolved digest'
+    value: ${{ steps.resolve.outputs.source-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve service image
+      id: resolve
+      shell: bash
+      env:
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+      run: |
+        set -euo pipefail
+
+        read_stable_service() {
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json |
+            jq -er '
+              if (.failures | length) == 0 and (.services | length) == 1 then .services[0]
+              else error("expected exactly one ECS service") end |
+              if .desiredCount > 0 and .runningCount == .desiredCount and .pendingCount == 0 and
+                (.deployments | length) == 1 and .deployments[0].rolloutState == "COMPLETED" and
+                .deployments[0].taskDefinition == .taskDefinition then .taskDefinition
+              else error("source service must have a completed, stable deployment") end'
+        }
+        task_definition="$(read_stable_service)"
+        repository_uri="$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY"           --query 'repositories[0].repositoryUri' --output text)"
+        if [ -z "$repository_uri" ] || [ "$repository_uri" = None ]; then
+          echo "::error::Could not resolve the expected ECR repository."
+          exit 1
+        fi
+
+        image_uri="$(aws ecs describe-task-definition \
+          --task-definition "$task_definition" \
+          --query "taskDefinition.containerDefinitions[?name=='${CONTAINER_NAME}'].image | [0]" \
+          --output text)"
+
+        case "$image_uri" in
+          "${repository_uri}"@sha256:*) ;;
+          *)
+            echo "::error::$CLUSTER/$SERVICE is not running a digest-pinned image"
+            echo "::error::from $ECR_REPOSITORY in container $CONTAINER_NAME: $image_uri"
+            exit 1
+            ;;
+        esac
+
+        digest="${image_uri#*@}"
+        if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::ECS returned an invalid image digest: $digest"
+          exit 1
+        fi
+
+        source_sha="$(aws ecr describe-images           --repository-name "$ECR_REPOSITORY" --image-ids "imageDigest=$digest"           --query 'imageDetails[0].imageTags' --output json |
+          jq -er '[.[] | select(test("^[0-9a-f]{40}$"))] | unique |
+            if length == 1 then .[0] else error("expected exactly one source commit tag") end')"
+        if [ "$(read_stable_service)" != "$task_definition" ]; then
+          echo "::error::Source service changed during image resolution. Retry after it settles."
+          exit 1
+        fi
+
+        echo "Resolved $CLUSTER/$SERVICE to $image_uri, built from $source_sha."
+        {
+          echo "task-definition-arn=$task_definition"
+          echo "image-uri=$image_uri"
+          echo "image-digest=$digest"
+          echo "source-sha=$source_sha"
+        } >> "$GITHUB_OUTPUT"

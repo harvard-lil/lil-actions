@@ -1,0 +1,114 @@
+name: Scale an ECS service to zero and back
+description: >
+  Stops a singleton service for the length of a deploy and starts it again on
+  the revision the deploy chose. mode stop records the service's desired count
+  and task definition as outputs and scales it to zero, waiting until no task
+  is running; mode start restores a desired count on a task definition with a
+  forced deployment and waits for that exact revision with the same predicate
+  ecs-wait-for-deployment uses. For services that must never run twice, such
+  as one Celery beat. Not for cron-style scheduled tasks, which keep running
+  through a deploy. AWS credentials must be configured before this action runs.
+inputs:
+  mode:
+    required: true
+    description: stop or start
+  cluster:
+    required: true
+    description: ECS cluster name
+  service:
+    required: true
+    description: ECS service name
+  desired-count:
+    default: ''
+    description: 'mode start: desired count to restore, normally the stop step''s desired-count output; 0 restores the count and does not wait'
+  task-definition:
+    default: ''
+    description: 'mode start: full task definition ARN to start on, normally the new revision or the stop step''s task-definition output'
+  timeout-seconds:
+    default: '300'
+    description: Seconds to wait for the running count to reach zero (stop) or the revision to become stable (start)
+  poll-interval-seconds:
+    default: '10'
+    description: Seconds between checks
+outputs:
+  desired-count:
+    description: 'mode stop: the desired count the service had before it was stopped'
+    value: ${{ steps.scale.outputs.desired-count }}
+  task-definition:
+    description: 'mode stop: the task definition the service was running before it was stopped'
+    value: ${{ steps.scale.outputs.task-definition }}
+runs:
+  using: composite
+  steps:
+    - id: scale
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MODE: ${{ inputs.mode }}
+        CLUSTER: ${{ inputs.cluster }}
+        SERVICE: ${{ inputs.service }}
+        DESIRED_COUNT: ${{ inputs.desired-count }}
+        TASK_DEFINITION: ${{ inputs.task-definition }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [[ ! "$POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::Timeout must be nonnegative and poll interval must be positive."
+          exit 1
+        fi
+
+        case "$MODE" in
+          stop)
+            response="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json)"
+            if ! jq -e '(.failures | length) == 0 and (.services | length) == 1' <<< "$response" >/dev/null; then
+              echo "::error::Could not read exactly one ECS service '${SERVICE}' in '${CLUSTER}'."
+              exit 1
+            fi
+            desired="$(jq -r '.services[0].desiredCount' <<< "$response")"
+            previous="$(jq -r '.services[0].taskDefinition' <<< "$response")"
+            {
+              echo "desired-count=${desired}"
+              echo "task-definition=${previous}"
+            } >> "$GITHUB_OUTPUT"
+            echo "${SERVICE} desired count is ${desired} on ${previous##*/}; setting it to 0."
+            aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+              --desired-count 0 --query 'service.serviceName' --output text >/dev/null
+
+            start_time="$(date +%s)"
+            while true; do
+              running="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+                --query 'services[0].runningCount' --output text)"
+              echo "$(date -u +%H:%M:%S) ${SERVICE}: ${running} running"
+              if [ "$running" = "0" ]; then
+                echo "${SERVICE} stopped."
+                exit 0
+              fi
+              if [ "$(( $(date +%s) - start_time ))" -ge "$TIMEOUT_SECONDS" ]; then
+                echo "::error::${SERVICE} still has ${running} task(s) running after ${TIMEOUT_SECONDS}s."
+                exit 1
+              fi
+              sleep "$POLL_INTERVAL_SECONDS"
+            done
+            ;;
+          start)
+            if [[ ! "$DESIRED_COUNT" =~ ^[0-9]+$ ]] || [ -z "$TASK_DEFINITION" ]; then
+              echo "::error::mode start needs a nonnegative desired-count and a task-definition."
+              exit 1
+            fi
+            echo "Starting ${SERVICE} at desired count ${DESIRED_COUNT} on ${TASK_DEFINITION##*/}."
+            aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+              --task-definition "$TASK_DEFINITION" --desired-count "$DESIRED_COUNT" --force-new-deployment \
+              --query 'service.serviceName' --output text >/dev/null
+            if [ "$DESIRED_COUNT" = "0" ]; then
+              echo "Desired count is 0, so there is no rollout to wait for."
+              exit 0
+            fi
+            EXPECTED_TASK_DEFINITION="$TASK_DEFINITION" bash "$ACTION_PATH/../scripts/ecs_wait_for_deployment.sh"
+            ;;
+          *)
+            echo "::error::mode must be 'stop' or 'start', got '${MODE}'."
+            exit 1
+            ;;
+        esac

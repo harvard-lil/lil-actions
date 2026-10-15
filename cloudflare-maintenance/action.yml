@@ -1,0 +1,207 @@
+name: 'Cloudflare maintenance page'
+description: >
+  Holds traffic at Cloudflare's edge by pointing a route at a maintenance
+  Worker, or releases it by deleting that route, and then confirms the change by
+  requesting the site.
+
+  Held at the edge rather than at the origin, so it still works when the origin
+  is gone -- which is the situation a maintenance page is most wanted in.
+
+  The Worker and page are managed in Terraform (lil-terraform's
+  lil-cloudflare-maintenance module). This action only attaches and detaches.
+
+inputs:
+  mode:
+    description: "'on' to hold traffic, 'off' to release it"
+    required: true
+  zone-id:
+    description: 'Cloudflare zone containing the hostnames'
+    required: true
+  script:
+    description: >
+      Worker script name to route traffic to, e.g. h2o-maintenance-prod.
+      Only used for mode: on. Checked for existence first, so a stale name
+      fails here rather than as a page that never appears.
+    required: false
+    default: ''
+  hostnames:
+    description: 'Comma-separated hostnames, e.g. opencasebook.org,www.opencasebook.org'
+    required: true
+  token:
+    description: >
+      Cloudflare API token. Needs Zone Workers Routes: Edit on the zone, plus
+      account-scoped Workers Scripts: Read for the mode 'on' script check.
+    required: true
+  account-id:
+    description: 'Cloudflare account ID; required for the script existence check'
+    required: false
+    default: '1e8159697c2f0b09bd8fc9f9f4a80e80'
+
+runs:
+  using: composite
+  steps:
+    - name: ${{ inputs.mode == 'on' && 'Hold traffic at Cloudflare' || 'Release traffic at Cloudflare' }}
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        ZONE_ID: ${{ inputs.zone-id }}
+        SCRIPT: ${{ inputs.script }}
+        HOSTNAMES: ${{ inputs.hostnames }}
+        CF_TOKEN: ${{ inputs.token }}
+        ACCOUNT_ID: ${{ inputs.account-id }}
+      run: |
+        set -euo pipefail
+        API=https://api.cloudflare.com/client/v4
+
+        case "$MODE" in
+          on|off) ;;
+          *) echo "::error::mode must be 'on' or 'off', got '$MODE'." ; exit 1 ;;
+        esac
+
+        # One Cloudflare call. Leaves the status in CF_STATUS and the response
+        # body in CF_BODY, and returns non-zero for anything outside 2xx.
+        #
+        # The status is what tells an absent resource apart from a token that is
+        # not allowed to look for it, so callers read it here instead of using
+        # curl --fail-with-body, which reports every 4xx and 5xx as exit 22.
+        cf() {
+          local method="$1" path="$2"; shift 2
+          local body_file; body_file="$(mktemp)"
+          CF_STATUS="$(curl -sS -o "$body_file" -w '%{http_code}' \
+            -X "$method" "${API}${path}" \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" "$@")" || CF_STATUS=000
+          CF_BODY="$(cat "$body_file")"
+          rm -f "$body_file"
+          case "$CF_STATUS" in
+            2??) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        # Reports the failure a cf() call just hit: what was being attempted,
+        # the token scope that would allow it, and what Cloudflare said. The
+        # optional third argument is extra context about a resource that is not
+        # there, printed on 404.
+        cf_fail() {
+          local what="$1" scope="$2" hint="${3:-}"
+          case "$CF_STATUS" in
+            401|403)
+              echo "::error::Not allowed to ${what}."
+              echo "::error::This needs a token carrying ${scope}."
+              ;;
+            404)
+              echo "::error::Could not ${what}: Cloudflare answered 404, which it uses both"
+              echo "::error::for a thing that is absent and for one the token cannot see."
+              echo "::error::Check the account, zone, and resource ids in the inputs, and"
+              echo "::error::check that the token carries ${scope}."
+              if [ -n "$hint" ]; then
+                echo "::error::${hint}"
+              fi
+              ;;
+            000)
+              echo "::error::No response from Cloudflare while trying to ${what}."
+              ;;
+            *)
+              echo "::error::Trying to ${what} returned HTTP ${CF_STATUS}."
+              ;;
+          esac
+          if [ -n "$CF_BODY" ]; then
+            echo "::error::Cloudflare said: $(printf '%s' "$CF_BODY" | tr -s '[:space:]' ' ' | cut -c1-400)"
+          fi
+        }
+
+        IFS=',' read -ra HOSTS <<< "$HOSTNAMES"
+        if [ "${#HOSTS[@]}" -eq 0 ]; then
+          echo "::error::No hostnames given."
+          exit 1
+        fi
+
+        if [ "$MODE" = "on" ]; then
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::mode 'on' needs a script name."
+            exit 1
+          fi
+          # Fail on a stale or mistyped name here, rather than leaving the
+          # confirmation loop to report the vaguer "the page never appeared".
+          if ! cf GET "/accounts/${ACCOUNT_ID}/workers/scripts/${SCRIPT}"; then
+            cf_fail "read Worker '${SCRIPT}' in account ${ACCOUNT_ID}" \
+              "account-scoped Workers Scripts: Read, which a zone-scoped token does not have" \
+              "The Worker is created by lil-terraform's lil-cloudflare-maintenance module."
+            exit 1
+          fi
+        fi
+
+        if ! cf GET "/zones/${ZONE_ID}/workers/routes"; then
+          cf_fail "list Workers routes for zone ${ZONE_ID}" \
+            "Zone Workers Routes: Read on that zone" \
+            "Check zone-id against the zone the hostnames actually live in."
+          exit 1
+        fi
+        existing="$CF_BODY"
+        if ! jq -e '.success == true' <<< "$existing" >/dev/null; then
+          echo "::error::Listing Workers routes for zone ${ZONE_ID} returned HTTP ${CF_STATUS} with success false."
+          jq -c '.errors // .' <<< "$existing" >&2 || echo "$existing" >&2
+          exit 1
+        fi
+
+        for host in "${HOSTS[@]}"; do
+          pattern="${host}/*"
+          route_id="$(jq -r --arg p "$pattern" '(.result // [])[] | select(.pattern == $p) | .id' <<< "$existing" | head -n1)"
+
+          if [ "$MODE" = "on" ]; then
+            if [ -n "$route_id" ]; then
+              echo "route already present for $pattern"
+              continue
+            fi
+            if ! cf POST "/zones/${ZONE_ID}/workers/routes" \
+              --data "$(jq -cn --arg p "$pattern" --arg s "$SCRIPT" '{pattern:$p, script:$s}')"; then
+              cf_fail "create a Workers route for ${pattern}" \
+                "Zone Workers Routes: Edit on zone ${ZONE_ID}"
+              exit 1
+            fi
+            echo "holding $pattern -> $SCRIPT"
+          else
+            if [ -z "$route_id" ]; then
+              echo "no route for $pattern; nothing to release"
+              continue
+            fi
+            if ! cf DELETE "/zones/${ZONE_ID}/workers/routes/${route_id}"; then
+              cf_fail "delete Workers route ${route_id} for ${pattern}" \
+                "Zone Workers Routes: Edit on zone ${ZONE_ID}" \
+                "The route was in the listing a moment ago; another run may have removed it."
+              exit 1
+            fi
+            echo "released $pattern"
+          fi
+        done
+
+        # Read the routes back rather than requesting the site. A request
+        # answers a different question and cannot always answer it: where a
+        # hostname sits behind Cloudflare Access the challenge arrives ahead of
+        # the Worker, so holding traffic never looks like 503 and releasing it
+        # always does, which reported success without having seen anything.
+        # What a caller needs to know is whether the route is in place, and the
+        # zone answers that directly.
+        after="$(cf GET "/zones/${ZONE_ID}/workers/routes")" || {
+          cf_fail "list Workers routes for zone ${ZONE_ID}" \
+            "Zone Workers Routes: Read on zone ${ZONE_ID}"
+          exit 1
+        }
+
+        for host in "${HOSTS[@]}"; do
+          pattern="${host}/*"
+          present="$(jq -r --arg p "$pattern" \
+            '[.result[] | select(.pattern == $p)] | length' <<< "$after")"
+          if [ "$MODE" = "on" ] && [ "$present" -eq 0 ]; then
+            echo "::error::${pattern} has no route after holding traffic."
+            echo "::error::Do not assume the window is open."
+            exit 1
+          fi
+          if [ "$MODE" = "off" ] && [ "$present" -ne 0 ]; then
+            echo "::error::${pattern} still routes to a maintenance page."
+            echo "::error::The site is not serving the application."
+            exit 1
+          fi
+        done
+        echo "Confirmed: traffic is $([ "$MODE" = "on" ] && echo held || echo flowing)."

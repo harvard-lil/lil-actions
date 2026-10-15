@@ -1,0 +1,71 @@
+# CI for this repo's own code.
+#
+# The other workflows here are `workflow_call` only -- they are pipelines this
+# repo offers to other repos, and none of them run against lil-actions itself.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deployment-actions:
+    name: Deployment action contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      # celery lets the Celery inspector's tests run against real apps.
+      - run: pip install pyyaml celery
+      - run: python -m unittest discover -s tests -v
+
+  composite-output-contract:
+    name: Composite failure outputs
+    runs-on: ubuntu-latest
+    env:
+      SEND_NOTIFICATIONS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Load and run preflight without deployment credentials
+        uses: ./deploy-preflight
+        with:
+          image-digest: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          source-sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          tier: staging
+      # This reports synthetic state only; it never changes infrastructure.
+      - name: Report a simulated failed release
+        id: failed-report
+        continue-on-error: true
+        uses: ./deploy-outcome
+        with:
+          window: 'true'
+          migrate-outcome: success
+          release-outcome: failure
+          site-url: https://example.invalid
+      - name: Verify outputs survive the composite action failure
+        if: always()
+        env:
+          OUTCOME: ${{ steps.failed-report.outcome }}
+          LEFT_BEHIND: ${{ steps.failed-report.outputs.left-behind }}
+          SUMMARY: ${{ steps.failed-report.outputs.summary }}
+        run: |
+          test "$OUTCOME" = failure
+          test "$LEFT_BEHIND" = true
+          [[ "$SUMMARY" == *"Maintenance page: STILL UP at https://example.invalid (release failure)"* ]]
+          [[ "$SUMMARY" == *"Migrations: applied (or none pending)"* ]]
+      # GitHub still loads the manifest, but this must never send a message.
+      - name: Validate notification manifest without sending Slack
+        if: env.SEND_NOTIFICATIONS == 'true'
+        uses: ./deploy-notify
+        with:
+          webhook: unused
+          status: failure
+          product: Test
+          tier-label: Test
+          site-url: https://example.invalid
