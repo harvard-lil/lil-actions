@@ -15,7 +15,7 @@ become stable. Covers stateless single-container apps whose task definition is
 owned by Terraform — CI only does `--force-new-deployment` against the
 `:latest` tag. Uses OIDC for AWS authentication.
 
-`app-name` must match the Terraform `app_name` variable; the workflow derives the ECR repository, ECS cluster, and ECS service names from `app-name` (and `environment` if set), matching the [`simple-web-app`](https://github.com/harvard-lil/lil-terraform/tree/main/modules/simple-web-app) module's naming.
+`app-name` must match the Terraform `app_name` variable; the workflow derives the ECR repository and ECS service names, and by default the ECS cluster name, from `app-name` (and `environment` if set), matching the [`simple-web-app`](https://github.com/harvard-lil/lil-terraform/tree/main/modules/simple-web-app) module's naming. Set `cluster` to deploy into a cluster the app does not own.
 
 Single-environment app:
 
@@ -40,6 +40,19 @@ jobs:
       environment: staging
     secrets:
       aws-role-arn: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+```
+
+App in a shared cluster, such as an ECS Anywhere fleet — set `cluster`; it is used as given, without an `environment` prefix, while the ECR repository and service keep the derived name. The app's GitHub role must be allowed to update the service in that cluster:
+
+```yaml
+jobs:
+  deploy:
+    uses: harvard-lil/lil-actions/.github/workflows/ecs-simple-deploy.yml@main
+    with:
+      app-name: my-app
+      cluster: lil-fleet-office
+    secrets:
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
 ```
 
 ### `secret-scan`

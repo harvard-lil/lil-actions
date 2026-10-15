@@ -16,6 +16,16 @@ on:
         required: false
         type: string
         default: ''
+      cluster:
+        description: >
+          ECS cluster name. Defaults to the resolved app name
+          ({environment}-{app-name}, or app-name). Set it when the service
+          runs in a shared cluster such as lil-fleet-office; it is used as
+          given, without an environment prefix. The ECR repository and ECS
+          service names still come from the resolved app name.
+        required: false
+        type: string
+        default: ''
       aws-region:
         description: 'AWS region'
         required: false
@@ -55,15 +65,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Resolve application full name
+      - name: Resolve resource names
         id: name
         shell: bash
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          CLUSTER: ${{ inputs.cluster }}
         run: |
-          if [ -n "${{ inputs.environment }}" ]; then
-            echo "full-name=${{ inputs.environment }}-${{ inputs.app-name }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$ENVIRONMENT" ]; then
+            full_name="$ENVIRONMENT-$APP_NAME"
           else
-            echo "full-name=${{ inputs.app-name }}" >> "$GITHUB_OUTPUT"
+            full_name="$APP_NAME"
           fi
+          echo "full-name=$full_name" >> "$GITHUB_OUTPUT"
+          echo "cluster=${CLUSTER:-$full_name}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -80,12 +96,12 @@ jobs:
       - name: Deploy to ECS
         uses: harvard-lil/lil-actions/ecs-deploy@main
         with:
-          cluster: ${{ steps.name.outputs.full-name }}
+          cluster: ${{ steps.name.outputs.cluster }}
           service: ${{ steps.name.outputs.full-name }}
 
       - name: Wait for ECS deployment
         uses: harvard-lil/lil-actions/ecs-wait-for-deployment@main
         with:
-          cluster: ${{ steps.name.outputs.full-name }}
+          cluster: ${{ steps.name.outputs.cluster }}
           service: ${{ steps.name.outputs.full-name }}
           timeout-seconds: ${{ inputs.timeout-seconds }}
